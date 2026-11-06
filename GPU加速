@@ -1,0 +1,706 @@
+import time
+import numpy as np
+import torch
+
+
+# ============================================================
+# GPU 基础设置
+# ============================================================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+
+torch.backends.cuda.matmul.allow_tf32 = False
+
+
+def to_gpu(x):
+    """将 numpy / list / tensor 转为 GPU float32 tensor"""
+    if isinstance(x, torch.Tensor):
+        return x.to(device=device, dtype=torch.float32)
+    return torch.as_tensor(np.asarray(x), dtype=torch.float32, device=device)
+
+
+# ============================================================
+# 10×10 高斯消元
+# 尽量保持原 solve_10x10 的消元方式：不进行行交换
+# ============================================================
+
+def solve_10x10_gpu(ATA, ATV):
+    """
+    ATA: [B, 10, 10]
+    ATV: [B, 10, K]
+    return: [B, 10, K]
+    """
+    M = ATA.clone()
+    b = ATV.clone()
+
+    eps = 1e-8
+
+    for i in range(10):
+        pivot = M[:, i, i]
+
+        # 对应原代码：当主元绝对值小于 eps 时，直接设为 eps
+        pivot = torch.where(
+            torch.abs(pivot) < eps,
+            torch.full_like(pivot, eps),
+            pivot
+        )
+
+        M[:, i, :] = M[:, i, :] / pivot[:, None]
+        b[:, i, :] = b[:, i, :] / pivot[:, None]
+
+        for k in range(10):
+            if k != i:
+                factor = M[:, k, i]
+
+                M[:, k, :] = M[:, k, :] - factor[:, None] * M[:, i, :]
+                b[:, k, :] = b[:, k, :] - factor[:, None] * b[:, i, :]
+
+    return b
+
+
+# ============================================================
+# XY 插值：批量寻找最近 36 个中心，进行 10 项多项式拟合
+# ============================================================
+
+@torch.no_grad()
+def interpolate_psf_xy_gpu(target_xy, centers, psfs, num_points=36):
+    """
+    target_xy: [B, 2]
+    centers:   [N, 2]
+    psfs:      [N, K, K]
+
+    return:
+        result: [B, K, K]
+    """
+
+    B = target_xy.shape[0]
+    N = centers.shape[0]
+
+    K = psfs.shape[-1]
+
+    # 1. 找最近的 36 个散斑中心
+    distance = torch.cdist(target_xy.unsqueeze(0), centers.unsqueeze(0)).squeeze(0)
+
+    nearest_dist, indices = torch.topk(
+        distance,
+        k=num_points,
+        dim=1,
+        largest=False,
+        sorted=True
+    )
+
+    # 最近中心对应的 PSF
+    selected_centers = centers[indices]       # [B, 36, 2]
+    selected_psfs = psfs[indices]             # [B, 36, K, K]
+
+    # 如果某个目标点恰好位于散斑中心，直接返回对应 PSF
+    exact_mask = nearest_dist[:, 0] < 1e-8
+
+    # 2. 构造多项式矩阵
+    x = selected_centers[:, :, 0] - target_xy[:, None, 0]
+    y = selected_centers[:, :, 1] - target_xy[:, None, 1]
+
+    x2 = x * x
+    y2 = y * y
+
+    A = torch.stack([
+        torch.ones_like(x),
+        x,
+        y,
+        x2,
+        y2,
+        x * y,
+        x2 * x,
+        x2 * y,
+        x * y2,
+        y2 * y
+    ], dim=-1)                                # [B, 36, 10]
+
+    # 3. 将 PSF 展平
+    values = selected_psfs.reshape(B, num_points, -1)
+
+    # 4. 最小二乘求解
+    AT = A.transpose(1, 2)
+
+    ATA = torch.bmm(AT, A)
+    ATV = torch.bmm(AT, values)
+
+    coeff = solve_10x10_gpu(ATA, ATV)
+
+    result = coeff[:, 0, :].reshape(B, K, K)
+
+    # 5. 精确中心位置直接使用原始 PSF
+    exact_psf = selected_psfs[:, 0]
+
+    result = torch.where(
+        exact_mask[:, None, None],
+        exact_psf,
+        result
+    )
+
+    return result
+
+
+# ============================================================
+# Z 插值：四点三次拉格朗日插值
+# 完全按照截图中的公式
+# ============================================================
+
+@torch.no_grad()
+def fast_inter_z_gpu(target_depth, selected_depths, psf_selected):
+    """
+    target_depth:   [B]
+    selected_depths:[4] 或 [B, 4]
+    psf_selected:   [B, 4, K, K]
+
+    return: [B, K, K]
+    """
+
+    if selected_depths.ndim == 1:
+        x = selected_depths[None, :].expand(target_depth.shape[0], -1)
+    else:
+        x = selected_depths
+
+    x0 = x[:, 0]
+    x1 = x[:, 1]
+    x2 = x[:, 2]
+    x3 = x[:, 3]
+
+    den0 = (x0 - x1) * (x0 - x2) * (x0 - x3)
+    den1 = (x1 - x0) * (x1 - x2) * (x1 - x3)
+    den2 = (x2 - x0) * (x2 - x1) * (x2 - x3)
+    den3 = (x3 - x0) * (x3 - x1) * (x3 - x2)
+
+    t = target_depth
+
+    w0 = ((t - x1) * (t - x2) * (t - x3)) / den0
+    w1 = ((t - x0) * (t - x2) * (t - x3)) / den1
+    w2 = ((t - x0) * (t - x1) * (t - x3)) / den2
+    w3 = ((t - x0) * (t - x1) * (t - x2)) / den3
+
+    weights = torch.stack([w0, w1, w2, w3], dim=1)
+
+    result = (
+        weights[:, 0, None, None] * psf_selected[:, 0] +
+        weights[:, 1, None, None] * psf_selected[:, 1] +
+        weights[:, 2, None, None] * psf_selected[:, 2] +
+        weights[:, 3, None, None] * psf_selected[:, 3]
+    )
+
+    return result
+
+
+# ============================================================
+# PSF 后处理
+# 保留原代码的 val、clip、归一化操作
+# ============================================================
+
+@torch.no_grad()
+def normalize_psf_gpu(psf):
+    """
+    psf: [B, K, K]
+    """
+
+    corner_mean = (
+        psf[:, 0, 0] +
+        psf[:, 0, -1] +
+        psf[:, -1, 0] +
+        psf[:, -1, -1]
+    ) / 4.0
+
+    val = 2.0 * 1e-5 / corner_mean
+
+    psf = psf * val[:, None, None]
+
+    # 对应原代码：
+    # np.clip(sanban_final - 1e-4, 0, sanban_final.max())
+    psf = torch.clamp(psf - 1e-4, min=0)
+
+    # 对应原代码：
+    # sanban_final = sanban_final / sanban_final.sum()
+    psf_sum = psf.sum(dim=(1, 2), keepdim=True)
+
+    psf = psf / torch.clamp(psf_sum, min=1e-20)
+
+    return psf
+
+
+# ============================================================
+# GPU 重叠累加
+# 每个像素的 PSF 乘以对应 image_black 灰度，再累加
+# ============================================================
+
+@torch.no_grad()
+def accumulate_psf_gpu(
+    output,
+    psfs,
+    pixel_values,
+    ii,
+    jj,
+    kernel_size
+):
+    """
+    output:       [H_out, W_out]
+    psfs:         [B, K, K]
+    pixel_values: [B]
+    ii, jj:       [B]
+    """
+
+    B = psfs.shape[0]
+    K = kernel_size
+
+    # 每个像素对应一个 PSF
+    values = psfs * pixel_values[:, None, None]
+
+    dy = torch.arange(K, device=device)
+    dx = torch.arange(K, device=device)
+
+    yy = ii[:, None, None] + dy[None, :, None]
+    xx = jj[:, None, None] + dx[None, None, :]
+
+    yy = yy.expand(-1, K, K)
+    xx = xx.expand(-1, K, K)
+
+    valid = (
+        (yy >= 0) & (yy < output.shape[0]) &
+        (xx >= 0) & (xx < output.shape[1])
+    )
+
+    flat_index = yy * output.shape[1] + xx
+
+    output.view(-1).scatter_add_(
+        0,
+        flat_index[valid].reshape(-1),
+        values[valid].reshape(-1)
+    )
+
+
+# ============================================================
+# 分批处理 31×31 分支
+# 1.4 < depth <= 5
+# ============================================================
+
+@torch.no_grad()
+def process_branch_31(
+    output,
+    ii,
+    jj,
+    target_depth,
+    depths,
+    centers_all,
+    sanbans_all,
+    starts,
+    counts,
+    image_values,
+    number=4
+):
+
+    B = len(ii)
+
+    # 全图坐标偏移：保留原始代码
+    target_xy = torch.stack([
+        jj.float() + 1500,
+        ii.float() + 1140
+    ], dim=1)
+
+    # 每个像素选择距离最近的 number 个深度
+    depth_distance = torch.abs(
+        target_depth[:, None] - depths[None, :]
+    )
+
+    depth_indices = torch.topk(
+        depth_distance,
+        k=number,
+        dim=1,
+        largest=False
+    ).indices
+
+    selected_depths = depths[depth_indices]
+
+    # 按深度从小到大排序
+    order = torch.argsort(selected_depths, dim=1)
+
+    depth_indices = torch.gather(depth_indices, 1, order)
+    selected_depths = torch.gather(selected_depths, 1, order)
+
+    sanbanz = torch.empty(
+        (B, 4, 31, 31),
+        dtype=torch.float32,
+        device=device
+    )
+
+    # 每一个深度分别做 XY 插值
+    for k in range(4):
+
+        current_depth_indices = depth_indices[:, k]
+
+        # 不同像素可能对应不同深度索引
+        unique_indices = torch.unique(current_depth_indices)
+
+        for global_i in unique_indices:
+
+            mask = current_depth_indices == global_i
+            local_ids = torch.nonzero(mask).squeeze(1)
+
+            depth_id = int(global_i.item())
+
+            st = int(starts[depth_id].item())
+            ct = int(counts[depth_id].item())
+
+            cur_centers = centers_all[st:st + ct]
+            cur_psfs = sanbans_all[st:st + ct]
+
+            cur_xy = target_xy[local_ids]
+
+            result = interpolate_psf_xy_gpu(
+                cur_xy,
+                cur_centers,
+                cur_psfs,
+                num_points=36
+            )
+
+            sanbanz[local_ids, k] = result
+
+    # 四点 Z 插值
+    sanban_final = fast_inter_z_gpu(
+        target_depth,
+        selected_depths,
+        sanbanz
+    )
+
+    # 原始后处理
+    sanban_final = normalize_psf_gpu(sanban_final)
+
+    # 原代码中 31×31 的累加
+    accumulate_psf_gpu(
+        output,
+        sanban_final,
+        image_values,
+        ii,
+        jj,
+        31
+    )
+
+
+# ============================================================
+# 分批处理 69×69 分支
+# 1.1 <= depth <= 1.4
+# ============================================================
+
+@torch.no_grad()
+def process_branch_69(
+    output,
+    ii,
+    jj,
+    target_depth,
+    depths3,
+    c1_1, s1_1,
+    c1_2, s1_2,
+    c1_3, s1_3,
+    c1_4, s1_4,
+    image_values
+):
+
+    B = len(ii)
+
+    # 全图坐标偏移：保留原始代码
+    target_xy = torch.stack([
+        jj.float() + 1500,
+        ii.float() + 1140
+    ], dim=1)
+
+    sanbanz = torch.empty(
+        (B, 4, 69, 69),
+        dtype=torch.float32,
+        device=device
+    )
+
+    centers_list = [c1_1, c1_2, c1_3, c1_4]
+    psfs_list = [s1_1, s1_2, s1_3, s1_4]
+
+    # 四组中心分别做 XY 插值
+    for k in range(4):
+
+        sanbanz[:, k] = interpolate_psf_xy_gpu(
+            target_xy,
+            centers_list[k],
+            psfs_list[k],
+            num_points=36
+        )
+
+    # 四点 Z 插值
+    sanban_final = fast_inter_z_gpu(
+        target_depth,
+        depths3,
+        sanbanz
+    )
+
+    # 原始后处理
+    sanban_final = normalize_psf_gpu(sanban_final)
+
+    accumulate_psf_gpu(
+        output,
+        sanban_final,
+        image_values,
+        ii,
+        jj,
+        69
+    )
+
+
+# ============================================================
+# 分批处理 199×199 分支
+# 0.5 <= depth < 1.1
+# ============================================================
+
+@torch.no_grad()
+def process_branch_199(
+    output,
+    ii,
+    jj,
+    target_depth,
+    depths2,
+    sanbans_all2,
+    image_values,
+    number=4
+):
+
+    B = len(ii)
+
+    depth_distance = torch.abs(
+        target_depth[:, None] - depths2[None, :]
+    )
+
+    depth_indices = torch.topk(
+        depth_distance,
+        k=number,
+        dim=1,
+        largest=False
+    ).indices
+
+    selected_depths = depths2[depth_indices]
+
+    # 按深度从小到大排序
+    order = torch.argsort(selected_depths, dim=1)
+
+    depth_indices = torch.gather(depth_indices, 1, order)
+    selected_depths = torch.gather(selected_depths, 1, order)
+
+    # 根据深度索引直接取 PSF
+    sanbanz = sanbans_all2[depth_indices]
+
+    sanban_final = fast_inter_z_gpu(
+        target_depth,
+        selected_depths,
+        sanbanz
+    )
+
+    sanban_final = normalize_psf_gpu(sanban_final)
+
+    accumulate_psf_gpu(
+        output,
+        sanban_final,
+        image_values,
+        ii,
+        jj,
+        199
+    )
+
+
+# ============================================================
+# 主函数：GPU 版本 process_image
+# ============================================================
+
+@torch.no_grad()
+def process_image_gpu(
+    depth_map,
+    image_black,
+    depths,
+    depths2,
+    depths3,
+    centers_all,
+    sanbans_all,
+    c1_1, s1_1,
+    c1_2, s1_2,
+    c1_3, s1_3,
+    c1_4, s1_4,
+    sanbans_all2,
+    starts,
+    counts,
+    number=4,
+    batch_size=256
+):
+
+    H, W = depth_map.shape
+
+    # 全部数据转到 GPU
+    depth_map = to_gpu(depth_map)
+    image_black = to_gpu(image_black)
+
+    depths = to_gpu(depths).flatten()
+    depths2 = to_gpu(depths2).flatten()
+    depths3 = to_gpu(depths3).flatten()
+
+    centers_all = to_gpu(centers_all)
+    sanbans_all = to_gpu(sanbans_all)
+
+    c1_1 = to_gpu(c1_1)
+    s1_1 = to_gpu(s1_1)
+
+    c1_2 = to_gpu(c1_2)
+    s1_2 = to_gpu(s1_2)
+
+    c1_3 = to_gpu(c1_3)
+    s1_3 = to_gpu(s1_3)
+
+    c1_4 = to_gpu(c1_4)
+    s1_4 = to_gpu(s1_4)
+
+    sanbans_all2 = to_gpu(sanbans_all2)
+
+    starts = torch.as_tensor(starts, dtype=torch.long, device=device)
+    counts = torch.as_tensor(counts, dtype=torch.long, device=device)
+
+    # 三个分支分别输出
+    # 输出尺寸留出 PSF 的右侧和下侧空间
+    output31 = torch.zeros(
+        (H + 31, W + 31),
+        dtype=torch.float32,
+        device=device
+    )
+
+    output69 = torch.zeros(
+        (H + 69, W + 69),
+        dtype=torch.float32,
+        device=device
+    )
+
+    output199 = torch.zeros(
+        (H + 199, W + 199),
+        dtype=torch.float32,
+        device=device
+    )
+
+    # 找出有效深度像素
+    valid_mask = (
+        (depth_map > 0) &
+        (
+            ((depth_map > 1.4) & (depth_map <= 5.0)) |
+            ((depth_map >= 1.1) & (depth_map <= 1.4)) |
+            ((depth_map >= 0.5) & (depth_map < 1.1))
+        )
+    )
+
+    valid_positions = torch.nonzero(valid_mask, as_tuple=False)
+
+    total = valid_positions.shape[0]
+
+    print("有效像素数量:", total)
+
+    start_time = time.time()
+
+    # 分批处理，控制显存占用
+    for start in range(0, total, batch_size):
+
+        end = min(start + batch_size, total)
+
+        positions = valid_positions[start:end]
+
+        ii = positions[:, 0]
+        jj = positions[:, 1]
+
+        target_depth = depth_map[ii, jj]
+        image_values = image_black[ii, jj]
+
+        # -------------------------------
+        # 31×31 分支
+        # -------------------------------
+        mask31 = (
+            (target_depth > 1.4) &
+            (target_depth <= 5.0)
+        )
+
+        if mask31.any():
+
+            idx = torch.nonzero(mask31).squeeze(1)
+
+            process_branch_31(
+                output31,
+                ii[idx],
+                jj[idx],
+                target_depth[idx],
+                depths,
+                centers_all,
+                sanbans_all,
+                starts,
+                counts,
+                image_values[idx],
+                number=number
+            )
+
+        # -------------------------------
+        # 69×69 分支
+        # -------------------------------
+        mask69 = (
+            (target_depth >= 1.1) &
+            (target_depth <= 1.4)
+        )
+
+        if mask69.any():
+
+            idx = torch.nonzero(mask69).squeeze(1)
+
+            process_branch_69(
+                output69,
+                ii[idx],
+                jj[idx],
+                target_depth[idx],
+                depths3,
+                c1_1, s1_1,
+                c1_2, s1_2,
+                c1_3, s1_3,
+                c1_4, s1_4,
+                image_values[idx]
+            )
+
+        # -------------------------------
+        # 199×199 分支
+        # -------------------------------
+        mask199 = (
+            (target_depth >= 0.5) &
+            (target_depth < 1.1)
+        )
+
+        if mask199.any():
+
+            idx = torch.nonzero(mask199).squeeze(1)
+
+            process_branch_199(
+                output199,
+                ii[idx],
+                jj[idx],
+                target_depth[idx],
+                depths2,
+                sanbans_all2,
+                image_values[idx],
+                number=number
+            )
+
+        if (start // batch_size) % 10 == 0:
+            torch.cuda.synchronize()
+            print(
+                f"进度: {end}/{total}, "
+                f"耗时: {time.time() - start_time:.2f}s"
+            )
+
+    torch.cuda.synchronize()
+
+    print("GPU 重建完成")
+    print("总耗时:", time.time() - start_time)
+
+    return (
+        output31.cpu().numpy(),
+        output69.cpu().numpy(),
+        output199.cpu().numpy()
+    )
