@@ -1,0 +1,36 @@
+@torch.no_grad()
+def fast_inter_z_gpu(target_depth, selected_depths, psf_selected):
+    """
+    target_depth:    [B]
+    selected_depths: [2] 或 [B, 2]
+    psf_selected:    [B, 2, K, K]
+
+    return: [B, K, K]
+    """
+
+    # 统一 selected_depths 的维度
+    if selected_depths.ndim == 1:
+        x = selected_depths[None, :].expand(
+            target_depth.shape[0], -1
+        )
+    else:
+        x = selected_depths
+
+    x0 = x[:, 0]
+    x1 = x[:, 1]
+
+    t = target_depth
+
+    # 两点线性插值权重
+    denom = x1 - x0
+
+    w0 = (x1 - t) / denom
+    w1 = (t - x0) / denom
+
+    # PSF 线性插值
+    result = (
+        w0[:, None, None] * psf_selected[:, 0] +
+        w1[:, None, None] * psf_selected[:, 1]
+    )
+
+    return result
