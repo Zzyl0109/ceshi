@@ -1,0 +1,99 @@
+
+@torch.no_grad()
+def precompute_xy_interpolation(
+    target_xy,
+    centers,
+    num_points=36,
+    ridge=1e-6
+):
+    """
+    提前计算空间插值所需的索引和拟合矩阵。
+
+    target_xy: [B, 2]
+    centers:   [N, 2]
+
+    return:
+        indices: [B, 36]
+        M:       [B, 6, 36]
+    """
+
+    # 1. 最近邻搜索
+    dist = torch.cdist(target_xy, centers)
+
+    dist_selected, indices = torch.topk(
+        dist,
+        k=num_points,
+        dim=1,
+        largest=False,
+        sorted=True
+    )
+
+    # 2. 取对应的采样中心
+    centers_selected = centers[indices]
+
+    dx = centers_selected[..., 0] - target_xy[:, None, 0]
+    dy = centers_selected[..., 1] - target_xy[:, None, 1]
+
+    # 3. 二次多项式设计矩阵
+    A = torch.stack([
+        torch.ones_like(dx),
+        dx,
+        dy,
+        dx * dx,
+        dx * dy,
+        dy * dy
+    ], dim=-1)
+
+    # 4. 距离权重
+    sigma = dist_selected[:, -1:].clamp_min(1e-6)
+
+    weights = torch.exp(
+        -0.5 * (dist_selected / sigma) ** 2
+    ).clamp_min(1e-6)
+
+    # 5. 计算拟合矩阵
+    Aw = A * weights.unsqueeze(-1)
+
+    ATA = A.transpose(1, 2) @ Aw
+
+    eye = torch.eye(
+        6,
+        device=A.device,
+        dtype=A.dtype
+    ).unsqueeze(0)
+
+    ATA = ATA + ridge * eye
+
+    ATW = A.transpose(1, 2) * weights[:, None, :]
+
+    M = torch.linalg.solve(ATA, ATW)
+
+    return indices, M
+
+
+
+
+@torch.no_grad()
+def interpolate_xy_precomputed(indices, M, psfs):
+    """
+    indices: [B, 36]
+    M:       [B, 6, 36]
+    psfs:    [N, K, K]
+
+    return:  [B, K, K]
+    """
+
+    B = indices.shape[0]
+    K = psfs.shape[-1]
+
+    # 提取对应的36个PSF
+    values = psfs[indices]       # [B, 36, K, K]
+    values = values.reshape(B, 36, -1)
+
+    # 二次多项式拟合
+    coeff = M @ values           # [B, 6, K*K]
+
+    # 取常数项
+    result = coeff[:, 0].reshape(B, K, K)
+
+    return result
