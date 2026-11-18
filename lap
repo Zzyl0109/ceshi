@@ -1,0 +1,64 @@
+
+class Lap_loss(nn.Module):
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+
+        kernel = torch.tensor(
+            [[0, 1, 0],
+             [1, -4, 1],
+             [0, 1, 0]],
+            dtype=torch.float32
+        ).view(1, 1, 3, 3)
+
+        self.register_buffer("kernel", kernel)
+        self.register_buffer(
+            "mask_kernel",
+            torch.ones(1, 1, 3, 3)
+        )
+
+    def lap_gradient(self, img):
+        kernel = self.kernel.to(dtype=img.dtype)
+        return F.conv2d(img, kernel, padding=1)
+
+    def forward(self, pred, gt, mask=None):
+
+        if mask is None:
+            valid_mask = gt > self.eps
+        else:
+            valid_mask = mask.bool()
+
+        # 确保形状为 [B, 1, H, W]
+        valid_mask = valid_mask.reshape_as(gt)
+
+        # 无效区域置零
+        pred = torch.where(
+            valid_mask, pred, torch.zeros_like(pred)
+        )
+        gt = torch.where(
+            valid_mask, gt, torch.zeros_like(gt)
+        )
+
+        # 计算有符号 Laplacian
+        pred_lap = self.lap_gradient(pred)
+        gt_lap = self.lap_gradient(gt)
+
+        # 只保留 3x3 邻域全部有效的位置
+        mask_kernel = self.mask_kernel.to(
+            dtype=pred.dtype
+        )
+
+        valid_count = F.conv2d(
+            valid_mask.to(pred.dtype),
+            mask_kernel,
+            padding=1
+        )
+
+        valid_lap_mask = (valid_count >= 9).to(pred.dtype)
+
+        # Laplacian 差异
+        loss = (
+            torch.abs(pred_lap - gt_lap) * valid_lap_mask
+        ).sum() / (valid_lap_mask.sum() + self.eps)
+
+        return loss
