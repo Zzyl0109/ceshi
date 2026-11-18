@@ -1,0 +1,107 @@
+@torch.no_grad()
+def interpolate_psf_xy_gpu_89(
+    target_xy,
+    centers,
+    psfs,
+    num_points=36,
+    ridge=1e-6,
+    batch_chunk=512,
+    pixel_chunk=1024
+):
+    """
+    89x89 PSF 分块空间插值
+
+    target_xy: [B, 2]
+    centers:   [N, 2]
+    psfs:      [N, 89, 89]
+
+    不一次性构造 [B, 36, 89, 89]
+    """
+
+    B = target_xy.shape[0]
+    K = psfs.shape[-1]
+    P = K * K
+
+    psfs_flat = psfs.reshape(psfs.shape[0], P)
+
+    # 最终结果
+    result = torch.empty(
+        (B, P),
+        device=target_xy.device,
+        dtype=psfs.dtype
+    )
+
+    eye = torch.eye(
+        6, device=target_xy.device, dtype=target_xy.dtype
+    ).unsqueeze(0)
+
+    for b0 in range(0, B, batch_chunk):
+
+        b1 = min(b0 + batch_chunk, B)
+        xy = target_xy[b0:b1]
+        cur_B = xy.shape[0]
+
+        # ---------------------------------
+        # 1. 最近邻搜索
+        # ---------------------------------
+        dist = torch.cdist(xy, centers)
+
+        dist_selected, indices = torch.topk(
+            dist,
+            k=num_points,
+            dim=1,
+            largest=False,
+            sorted=True
+        )
+
+        centers_selected = centers[indices]
+
+        dx = centers_selected[..., 0] - xy[:, None, 0]
+        dy = centers_selected[..., 1] - xy[:, None, 1]
+
+        A = torch.stack([
+            torch.ones_like(dx),
+            dx,
+            dy,
+            dx * dx,
+            dx * dy,
+            dy * dy
+        ], dim=-1)
+
+        # ---------------------------------
+        # 2. 距离权重
+        # ---------------------------------
+        sigma = dist_selected[:, -1:].clamp_min(1e-6)
+
+        weights = torch.exp(
+            -0.5 * (dist_selected / sigma) ** 2
+        ).clamp_min(1e-6)
+
+        # ---------------------------------
+        # 3. 计算 ATA，只需要计算一次
+        # ---------------------------------
+        Aw = A * weights.unsqueeze(-1)
+
+        ATA = A.transpose(1, 2) @ Aw
+        ATA = ATA + ridge * eye
+
+        # ---------------------------------
+        # 4. 沿PSF像素维度分块计算 ATV
+        # ---------------------------------
+        for p0 in range(0, P, pixel_chunk):
+
+            p1 = min(p0 + pixel_chunk, P)
+
+            # 只读取当前像素区间的36个PSF
+            values = psfs_flat[indices, p0:p1]
+
+            # [cur_B, 6, pixel_chunk]
+            ATV = Aw.transpose(1, 2) @ values
+
+            # 解方程
+            coeff = torch.linalg.solve(ATA, ATV)
+
+            # 目标位置为局部坐标(0,0)，取常数项
+            result[b0:b1, p0:p1] = coeff[:, 0, :]
+
+    return result.reshape(B, K, K)
