@@ -69,6 +69,104 @@ def depth_segment_l1(pred_path, gt_path):
         )
 
     # 整体 MAE
+
+
+import numpy as np
+import tifffile
+
+
+def depth_segment_l1(
+    pred_path,
+    gt_path,
+    min_depth=0.5,
+    max_depth=5.0,
+    interval=0.5
+):
+    # 读取 TIFF
+    pred = tifffile.imread(pred_path).astype(np.float32)
+    gt = tifffile.imread(gt_path).astype(np.float32)
+
+    assert pred.shape == gt.shape, "Pred 和 GT 尺寸不一致！"
+    assert min_depth < max_depth, "最小深度必须小于最大深度！"
+    assert interval > 0, "分段间隔必须大于0！"
+
+    # 有效像素
+    valid = (
+        np.isfinite(pred) &
+        np.isfinite(gt) &
+        (gt >= min_depth) &
+        (gt <= max_depth)
+    )
+
+    abs_error = np.abs(pred - gt)
+
+    # 自动生成深度分段
+    edges = np.arange(min_depth, max_depth, interval)
+    edges = np.append(edges, max_depth)
+
+    results = []
+
+    print("\n========== 分深度段 L1 误差 ==========")
+
+    for i in range(len(edges) - 1):
+        low = edges[i]
+        high = edges[i + 1]
+
+        # 第一段包含左端点，其余区间左开右闭
+        if i == 0:
+            mask = valid & (gt >= low) & (gt <= high)
+        else:
+            mask = valid & (gt > low) & (gt <= high)
+
+        count = np.count_nonzero(mask)
+
+        if count > 0:
+            mae = abs_error[mask].sum() / count
+        else:
+            mae = np.nan
+
+        results.append({
+            "range": (low, high),
+            "count": count,
+            "mae": mae
+        })
+
+        print(
+            f"{low:.2f} - {high:.2f} m | "
+            f"像素数: {count:10d} | "
+            f"平均 L1: {mae:.6f} m"
+        )
+
+    # 整体 MAE
+    total_count = np.count_nonzero(valid)
+
+    if total_count > 0:
+        total_mae = abs_error[valid].sum() / total_count
+        print("-------------------------------------")
+        print(f"整体有效像素数: {total_count}")
+        print(f"整体平均 L1: {total_mae:.6f} m")
+
+    return results
+
+
+# ==================================================
+# 参数设置
+# ==================================================
+
+pred_path = r"D:\result\pred.tiff"
+gt_path = r"D:\result\gt.tiff"
+
+MIN_DEPTH = 0.5
+MAX_DEPTH = 5.0
+INTERVAL = 0.2
+
+results = depth_segment_l1(
+    pred_path,
+    gt_path,
+    min_depth=MIN_DEPTH,
+    max_depth=MAX_DEPTH,
+    interval=INTERVAL
+)
     total_count = np.count_nonzero(valid)
 
     if total_count > 0:
