@@ -1,0 +1,80 @@
+pred_path = r"D:\result\pred.tiff"
+gt_path = r"D:\result\gt.tiff"
+
+results = depth_segment_l1(pred_path, gt_path)
+
+import numpy as np
+import tifffile
+
+
+def depth_segment_l1(pred_path, gt_path):
+
+    # 读取 TIFF，保留原始深度数值
+    pred = tifffile.imread(pred_path).astype(np.float32)
+    gt = tifffile.imread(gt_path).astype(np.float32)
+
+    # 检查尺寸
+    assert pred.shape == gt.shape, \
+        f"尺寸不一致：pred={pred.shape}, gt={gt.shape}"
+
+    # 深度区间
+    bins = [
+        (0.5, 1.0, True),
+        (1.0, 1.5, False),
+        (1.5, 2.0, False),
+        (2.0, 2.5, False),
+        (2.5, 3.0, False),
+        (3.0, 3.5, False),
+        (3.5, 4.0, False),
+        (4.0, 4.5, False),
+        (4.5, 5.0, False),
+    ]
+
+    # 有效像素
+    valid = (
+        np.isfinite(pred) &
+        np.isfinite(gt) &
+        (gt >= 0.5) &
+        (gt <= 5.0)
+    )
+
+    abs_error = np.abs(pred - gt)
+
+    results = []
+
+    for i, (low, high, first) in enumerate(bins):
+
+        if first:
+            mask = valid & (gt >= low) & (gt <= high)
+        else:
+            mask = valid & (gt > low) & (gt <= high)
+
+        count = np.count_nonzero(mask)
+
+        if count > 0:
+            mae = abs_error[mask].sum() / count
+        else:
+            mae = np.nan
+
+        results.append((low, high, count, mae))
+
+    # 输出结果
+    print("\n========== 分深度段 L1 误差 ==========")
+
+    for low, high, count, mae in results:
+        print(
+            f"{low:.1f} - {high:.1f} m | "
+            f"像素数: {count:10d} | "
+            f"平均 L1: {mae:.6f} m"
+        )
+
+    # 整体 MAE
+    total_count = np.count_nonzero(valid)
+
+    if total_count > 0:
+        total_mae = abs_error[valid].sum() / total_count
+        print("-------------------------------------")
+        print(f"整体有效像素数: {total_count}")
+        print(f"整体平均 L1: {total_mae:.6f} m")
+
+    return results
