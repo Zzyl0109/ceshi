@@ -1,0 +1,185 @@
+import torch
+
+
+@torch.no_grad()
+def interpolate_psf_xy_gpu(
+    target_xy,
+    centers,
+    psfs,
+    num_points=36,
+    sigma=None,
+    ridge=1e-6,
+    interior_margin=0.05
+):
+    """
+    target_xy: [B, 2]       目标坐标，顺序为 [x, y]
+    centers:   [M, 2]       散斑中心坐标，顺序为 [x, y]
+    psfs:      [M, K, K]    每个散斑中心对应的PSF
+
+    返回:
+        result: [B, K, K]
+
+    内部区域：10项三次多项式加权拟合
+    外部区域：最近邻PSF高斯加权平均
+    """
+
+    device = target_xy.device
+    dtype = target_xy.dtype
+
+    B = target_xy.shape[0]
+    K = psfs.shape[-1]
+
+    # ==================================================
+    # 1. 最近邻搜索
+    # ==================================================
+
+    dist = torch.cdist(target_xy, centers)
+
+    dist_selected, indices = torch.topk(
+        dist,
+        k=num_points,
+        dim=1,
+        largest=False,
+        sorted=True
+    )
+
+    centers_selected = centers[indices]
+    psfs_selected = psfs[indices]
+
+    # 相对于目标点的坐标差
+    dx_raw = (
+        centers_selected[..., 0] -
+        target_xy[:, None, 0]
+    )
+
+    dy_raw = (
+        centers_selected[..., 1] -
+        target_xy[:, None, 1]
+    )
+
+    # ==================================================
+    # 2. 判断目标点是否被散斑中心包围
+    # ==================================================
+
+    angles = torch.atan2(dy_raw, dx_raw)
+
+    angles, _ = torch.sort(angles, dim=1)
+
+    angle_gaps = angles[:, 1:] - angles[:, :-1]
+
+    # 最后一个点到第一个点的角度间隔
+    last_gap = (
+        angles[:, 0] + 2 * torch.pi - angles[:, -1]
+    )
+
+    angle_gaps = torch.cat(
+        [angle_gaps, last_gap[:, None]],
+        dim=1
+    )
+
+    max_gap = angle_gaps.max(dim=1).values
+
+    # 最大角度间隔小于180度，说明目标点被中心包围
+    is_inside = max_gap < (
+        torch.pi - interior_margin
+    )
+
+    # ==================================================
+    # 3. 外插区域：高斯加权平均
+    # ==================================================
+
+    if sigma is None:
+        sigma_value = dist_selected[:, -1:].clamp_min(1e-6)
+    else:
+        sigma_value = torch.as_tensor(
+            sigma, device=device, dtype=dtype
+        )
+        if sigma_value.ndim == 0:
+            sigma_value = sigma_value.expand(B, 1)
+        elif sigma_value.ndim == 1:
+            sigma_value = sigma_value[:, None]
+
+    weights = torch.exp(
+        -0.5 * (dist_selected / sigma_value) ** 2
+    )
+
+    weights = weights.clamp_min(1e-8)
+
+    # 归一化权重
+    weights_norm = weights / weights.sum(
+        dim=1, keepdim=True
+    )
+
+    # [B, 36, K*K]
+    values = psfs_selected.reshape(
+        B, num_points, -1
+    )
+
+    # 外部区域不做多项式外插
+    result_outside = (
+        values * weights_norm.unsqueeze(-1)
+    ).sum(dim=1)
+
+    # ==================================================
+    # 4. 内插区域：三次多项式加权拟合
+    # ==================================================
+
+    result = result_outside.clone()
+
+    inside_idx = torch.where(is_inside)[0]
+
+    if inside_idx.numel() > 0:
+
+        dx = dx_raw[inside_idx]
+        dy = dy_raw[inside_idx]
+
+        local_dist = dist_selected[inside_idx]
+
+        local_weights = weights[inside_idx]
+
+        local_values = values[inside_idx]
+
+        # 局部坐标归一化
+        scale = local_dist[:, -1:].clamp_min(1e-6)
+
+        x = dx / scale
+        y = dy / scale
+
+        # 10项三次多项式
+        A = torch.stack([
+            torch.ones_like(x),
+            x,
+            y,
+            x * x,
+            x * y,
+            y * y,
+            x * x * x,
+            x * x * y,
+            x * y * y,
+            y * y * y
+        ], dim=-1)
+
+        # 加权最小二乘
+        Aw = A * local_weights.unsqueeze(-1)
+
+        ATA = A.transpose(1, 2) @ Aw
+
+        ATV = A.transpose(1, 2) @ (
+            local_values * local_weights.unsqueeze(-1)
+        )
+
+        eye = torch.eye(
+            10, device=device, dtype=dtype
+        ).unsqueeze(0)
+
+        ATA = ATA + ridge * eye
+
+        coeff = torch.linalg.solve(ATA, ATV)
+
+        # 目标点的局部坐标为(0,0)
+        # 因此多项式常数项就是目标点的预测PSF
+        result_inside = coeff[:, 0, :]
+
+        result[inside_idx] = result_inside
+
+    return result.reshape(B, K, K)
