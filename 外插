@@ -1,6 +1,22 @@
 import torch
 import torch
+cur_xy = target_xy[local_ids]
 
+# 31×31 PSF，先尝试256
+batch_size = 256
+
+for start in range(0, len(cur_xy), batch_size):
+
+    end = min(start + batch_size, len(cur_xy))
+
+    result = interpolate_psf_xy_gpu(
+        cur_xy[start:end],
+        cur_centers,
+        cur_psfs,
+        num_points=36
+    )
+
+    sanban2[local_ids[start:end], k] = result
 @torch.no_grad()
 def interpolate_all_gpu(
     target_xy,
