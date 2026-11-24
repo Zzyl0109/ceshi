@@ -1,4 +1,40 @@
 import torch
+
+# values: [B, 36, K*K]
+
+# 加权矩阵
+Aw = A * weights.unsqueeze(-1)
+
+# [B, 10, 10]
+ATA = A.transpose(1, 2) @ Aw
+
+# [B, 10, 36]
+ATW = Aw.transpose(1, 2)
+
+eye = torch.eye(
+    10, device=A.device, dtype=A.dtype
+).unsqueeze(0)
+
+ATA = ATA + ridge * eye
+
+# 只求解36个散斑对应的组合权重
+# [B, 10, 36]
+beta = torch.linalg.solve(ATA, ATW)
+
+# 只取多项式常数项
+# [B, 36]
+beta = beta[:, 0, :]
+
+# 36个PSF加权组合
+# [B, K*K]
+result = torch.sum(
+    beta.unsqueeze(-1) * values,
+    dim=1
+)
+
+return result.reshape(B, K, K)
+
+
 import torch
 cur_xy = target_xy[local_ids]
 
