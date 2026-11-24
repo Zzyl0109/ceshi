@@ -1,5 +1,32 @@
 import torch
+import torch
 
+@torch.no_grad()
+def interpolate_all_gpu(
+    target_xy,
+    centers,
+    psfs,
+    batch_size=128,
+    num_points=36
+):
+    results = []
+
+    for start in range(0, len(target_xy), batch_size):
+
+        end = min(start + batch_size, len(target_xy))
+
+        target_batch = target_xy[start:end]
+
+        result = interpolate_psf_xy_gpu(
+            target_xy=target_batch,
+            centers=centers,
+            psfs=psfs,
+            num_points=num_points
+        )
+
+        results.append(result)
+
+    return torch.cat(results, dim=0)
 
 @torch.no_grad()
 def interpolate_psf_xy_gpu(
