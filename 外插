@@ -1,3 +1,231 @@
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# 1. 深度可分离卷积
+# ============================================================
+
+class DSConv(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            # Depthwise
+            nn.Conv2d(
+                in_channels,
+                in_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                groups=in_channels,
+                bias=False
+            ),
+            nn.BatchNorm2d(in_channels),
+            nn.GELU(),
+
+            # Pointwise
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                bias=False
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+# ============================================================
+# 2. 普通卷积块
+# ============================================================
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels, out_channels,
+                kernel_size=3, padding=1, bias=False
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU(),
+
+            nn.Conv2d(
+                out_channels, out_channels,
+                kernel_size=3, padding=1, bias=False
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+# ============================================================
+# 3. 上采样 + 特征融合
+# ============================================================
+
+class UpBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+
+        self.conv = nn.Sequential(
+            DSConv(
+                in_channels + skip_channels,
+                out_channels
+            ),
+            DSConv(
+                out_channels,
+                out_channels
+            )
+        )
+
+    def forward(self, x, skip):
+
+        x = F.interpolate(
+            x,
+            size=skip.shape[-2:],
+            mode='bilinear',
+            align_corners=False
+        )
+
+        x = torch.cat([x, skip], dim=1)
+
+        return self.conv(x)
+
+
+# ============================================================
+# 4. DA 深度校准网络
+# ============================================================
+
+class DACalibrator(nn.Module):
+
+    def __init__(
+        self,
+        in_channels=1,
+        b_scale=1.0,
+        k_range=0.2
+    ):
+        super().__init__()
+
+        self.b_scale = b_scale
+        self.k_range = k_range
+
+        # ----------------------------------------------------
+        # 全分辨率浅层特征
+        # ----------------------------------------------------
+        self.stem = DSConv(in_channels, 8, stride=1)
+
+        # ----------------------------------------------------
+        # Encoder
+        # ----------------------------------------------------
+        self.down1 = DSConv(8, 16, stride=2)
+        self.down2 = DSConv(16, 24, stride=2)
+        self.down3 = DSConv(24, 32, stride=2)
+        self.down4 = DSConv(32, 64, stride=2)
+
+        # ----------------------------------------------------
+        # Bottleneck
+        # ----------------------------------------------------
+        self.bottleneck = nn.Sequential(
+            DSConv(64, 64),
+            DSConv(64, 64)
+        )
+
+        # ----------------------------------------------------
+        # Decoder
+        # ----------------------------------------------------
+        self.up1 = UpBlock(64, 32, 32)
+        self.up2 = UpBlock(32, 24, 24)
+        self.up3 = UpBlock(24, 16, 16)
+        self.up4 = UpBlock(16, 8, 8)
+
+        # ----------------------------------------------------
+        # 全分辨率特征融合
+        # ----------------------------------------------------
+        self.full_fusion = nn.Sequential(
+            DSConv(8 + 8, 8),
+            DSConv(8, 8)
+        )
+
+        # ----------------------------------------------------
+        # K、B 两个输出分支
+        # ----------------------------------------------------
+        self.k_head = nn.Conv2d(8, 1, kernel_size=1)
+        self.b_head = nn.Conv2d(8, 1, kernel_size=1)
+
+        # 初始化为恒等映射
+        nn.init.zeros_(self.k_head.weight)
+        nn.init.zeros_(self.k_head.bias)
+
+        nn.init.zeros_(self.b_head.weight)
+        nn.init.zeros_(self.b_head.bias)
+
+    def forward(self, da_depth):
+
+        # 原始尺寸
+        original_size = da_depth.shape[-2:]
+
+        # ----------------------------------------------------
+        # Encoder
+        # ----------------------------------------------------
+        f0 = self.stem(da_depth)
+
+        f1 = self.down1(f0)
+        f2 = self.down2(f1)
+        f3 = self.down3(f2)
+        f4 = self.down4(f3)
+
+        # ----------------------------------------------------
+        # Bottleneck
+        # ----------------------------------------------------
+        f4 = self.bottleneck(f4)
+
+        # ----------------------------------------------------
+        # Decoder
+        # ----------------------------------------------------
+        d3 = self.up1(f4, f3)
+        d2 = self.up2(d3, f2)
+        d1 = self.up3(d2, f1)
+        d0 = self.up4(d1, f0)
+
+        # ----------------------------------------------------
+        # 全分辨率特征融合
+        # ----------------------------------------------------
+        full_feat = self.full_fusion(
+            torch.cat([d0, f0], dim=1)
+        )
+
+        # ----------------------------------------------------
+        # 预测 K、B
+        # ----------------------------------------------------
+        k_raw = self.k_head(full_feat)
+        b_raw = self.b_head(full_feat)
+
+        delta_k = self.k_range * torch.tanh(k_raw)
+        delta_b = self.b_scale * torch.tanh(b_raw)
+
+        # ----------------------------------------------------
+        # 逐像素仿射校准
+        # ----------------------------------------------------
+        K = 1.0 + delta_k
+        B = delta_b
+
+        pred = da_depth * K + B
+
+        return pred, K, B
+
+
+
+
 # ==================================================
 # 1. 最近邻搜索
 # ==================================================
