@@ -1,0 +1,577 @@
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ScaleEncoder(nn.Module):
+    def __init__(self, in_ch=1):
+        super().__init__()
+
+        self.stem = ConvBlock(in_ch, 32)
+
+        self.down1 = nn.Sequential(
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            ConvBlock(64, 64)
+        )
+
+        self.down2 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            ConvBlock(128, 128)
+        )
+
+        self.down3 = nn.Sequential(
+            nn.Conv2d(128, 192, 3, stride=2, padding=1),
+            ConvBlock(192, 192)
+        )
+
+    def forward(self, x):
+        f1 = self.stem(x)
+        f2 = self.down1(f1)
+        f3 = self.down2(f2)
+        f4 = self.down3(f3)
+
+        return f1, f2, f3, f4
+
+self.encoder1 = ScaleEncoder(1)
+self.encoder2 = ScaleEncoder(1)
+self.encoder3 = ScaleEncoder(1)
+
+
+da1 = F.interpolate(
+    da_feat, size=(3672, 5496),
+    mode="bilinear", align_corners=False
+)
+
+da2 = F.interpolate(
+    da_feat, size=(1836, 2748),
+    mode="bilinear", align_corners=False
+)
+
+da3 = F.interpolate(
+    da_feat, size=(918, 1374),
+    mode="bilinear", align_corners=False
+)
+
+
+
+
+
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# 基础卷积模块
+# ============================================================
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_ch, out_ch,
+                kernel_size=3,
+                stride=stride,
+                padding=1,
+                bias=False
+            ),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+
+            nn.Conv2d(
+                out_ch, out_ch,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                bias=False
+            ),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+# ============================================================
+# 每个尺度独立的 CNN Encoder
+#
+# 输入：B x 2 x P x P
+# 输出：B x 48 x P/4 x P/4
+#
+# 两次 stride=2 下采样
+# ============================================================
+
+class PatchEncoder(nn.Module):
+    def __init__(self, in_ch=2, base_ch=32, out_ch=48):
+        super().__init__()
+
+        self.down1 = ConvBlock(
+            in_ch, base_ch, stride=2
+        )
+
+        self.down2 = ConvBlock(
+            base_ch, out_ch, stride=2
+        )
+
+        self.refine = ConvBlock(
+            out_ch, out_ch, stride=1
+        )
+
+    def forward(self, x):
+        x = self.down1(x)
+        x = self.down2(x)
+        x = self.refine(x)
+
+        return x
+
+
+# ============================================================
+# 多尺度大视场重建网络
+# ============================================================
+
+class MultiScaleDepthNet(nn.Module):
+
+    def __init__(
+        self,
+        patch_fine=1024,
+        stride_fine=768,
+
+        patch_coarse=512,
+        stride_coarse=384,
+
+        feature_ch=48,
+        fuse_ch=64
+    ):
+        super().__init__()
+
+        self.patch_fine = patch_fine
+        self.stride_fine = stride_fine
+
+        self.patch_coarse = patch_coarse
+        self.stride_coarse = stride_coarse
+
+        self.feature_ch = feature_ch
+
+        # ----------------------------------------------------
+        # 两个完全独立的 Encoder
+        # ----------------------------------------------------
+
+        self.encoder_fine = PatchEncoder(
+            in_ch=2,
+            base_ch=32,
+            out_ch=feature_ch
+        )
+
+        self.encoder_coarse = PatchEncoder(
+            in_ch=2,
+            base_ch=32,
+            out_ch=feature_ch
+        )
+
+        # ----------------------------------------------------
+        # 多尺度特征投影
+        # ----------------------------------------------------
+
+        self.fine_proj = nn.Sequential(
+            nn.Conv2d(feature_ch, fuse_ch, 1, bias=False),
+            nn.GroupNorm(8, fuse_ch),
+            nn.GELU()
+        )
+
+        self.coarse_proj = nn.Sequential(
+            nn.Conv2d(feature_ch, fuse_ch, 1, bias=False),
+            nn.GroupNorm(8, fuse_ch),
+            nn.GELU()
+        )
+
+        # ----------------------------------------------------
+        # 特征融合
+        # ----------------------------------------------------
+
+        self.fusion = nn.Sequential(
+            ConvBlock(fuse_ch * 2, fuse_ch),
+            ConvBlock(fuse_ch, fuse_ch)
+        )
+
+        # ----------------------------------------------------
+        # K、B 预测头
+        # ----------------------------------------------------
+
+        self.head = nn.Sequential(
+            ConvBlock(fuse_ch, 32),
+            nn.Conv2d(32, 2, kernel_size=1)
+        )
+
+        # 初始化为 K=1, B=0
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+
+    # ========================================================
+    # 生成切块坐标
+    # ========================================================
+
+    @staticmethod
+    def get_starts(length, patch, stride):
+
+        if length <= patch:
+            return [0]
+
+        starts = list(
+            range(0, length - patch + 1, stride)
+        )
+
+        last = length - patch
+
+        if starts[-1] != last:
+            starts.append(last)
+
+        return starts
+
+    # ========================================================
+    # Hann 权重，边缘保留最小权重
+    # ========================================================
+
+    @staticmethod
+    def make_weight(size, device, dtype):
+
+        w = torch.hann_window(
+            size,
+            periodic=False,
+            device=device,
+            dtype=dtype
+        )
+
+        w = w.clamp_min(0.05)
+
+        weight = w[:, None] * w[None, :]
+
+        return weight[None, None]
+
+    # ========================================================
+    # 对某一个尺度进行切块、编码、重叠拼接
+    #
+    # image: B x 1 x H x W
+    # da:    B x 1 x H x W
+    #
+    # return: B x C x H/4 x W/4
+    # ========================================================
+
+    def encode_and_stitch(
+        self,
+        image,
+        da,
+        encoder,
+        patch_size,
+        stride
+    ):
+
+        B, _, H, W = image.shape
+
+        device = image.device
+
+        # 特征图尺寸
+        Hf = H // 4
+        Wf = W // 4
+
+        pf = patch_size // 4
+
+        # 所有切块起点
+        ys = self.get_starts(
+            H, patch_size, stride
+        )
+
+        xs = self.get_starts(
+            W, patch_size, stride
+        )
+
+        # 拼接累积
+        accum = torch.zeros(
+            B,
+            self.feature_ch,
+            Hf * Wf,
+            device=device,
+            dtype=image.dtype
+        )
+
+        weight_sum = torch.zeros(
+            1, 1, Hf * Wf,
+            device=device,
+            dtype=image.dtype
+        )
+
+        weight = self.make_weight(
+            pf, device, image.dtype
+        )
+
+        weight_flat = weight.flatten(2)
+
+        # ----------------------------------------------------
+        # 逐块提取、编码
+        # ----------------------------------------------------
+
+        for y in ys:
+            for x in xs:
+
+                y_patch = image[
+                    :, :, y:y + patch_size,
+                    x:x + patch_size
+                ]
+
+                da_patch = da[
+                    :, :, y:y + patch_size,
+                    x:x + patch_size
+                ]
+
+                # Y 与 DA 在相同坐标下拼接
+                patch = torch.cat(
+                    [y_patch, da_patch],
+                    dim=1
+                )
+
+                feat = encoder(patch)
+
+                # 特征图对应的全局坐标
+                fy = y // 4
+                fx = x // 4
+
+                yy, xx = torch.meshgrid(
+                    torch.arange(
+                        fy, fy + pf, device=device
+                    ),
+                    torch.arange(
+                        fx, fx + pf, device=device
+                    ),
+                    indexing="ij"
+                )
+
+                index = (
+                    yy * Wf + xx
+                ).reshape(-1).long()
+
+                feat_flat = feat.flatten(2)
+
+                weighted_feat = (
+                    feat_flat * weight_flat
+                )
+
+                # 可微分的重叠累积
+                accum = accum.index_add(
+                    2, index, weighted_feat
+                )
+
+                weight_sum = weight_sum.index_add(
+                    2,
+                    index,
+                    weight_flat
+                )
+
+        # 加权平均
+        feat_map = (
+            accum /
+            weight_sum.clamp_min(1e-6)
+        )
+
+        feat_map = feat_map.reshape(
+            B, self.feature_ch, Hf, Wf
+        )
+
+        return feat_map
+
+    # ========================================================
+    # Forward
+    #
+    # blur: B x 1 x H x W
+    # da:   B x 1 x 518 x 518
+    #
+    # return:
+    # depth: B x 1 x H x W
+    # K:     B x 1 x H x W
+    # B:     B x 1 x H x W
+    # ========================================================
+
+    def forward(self, blur, da):
+
+        B, _, H, W = blur.shape
+
+        # ----------------------------------------------------
+        # 1. 将原图补齐到 16 的倍数
+        #
+        # 保证两个尺度的切块坐标和特征坐标对齐
+        # ----------------------------------------------------
+
+        H_pad = max(
+            self.patch_fine,
+            math.ceil(H / 16) * 16
+        )
+
+        W_pad = max(
+            self.patch_fine,
+            math.ceil(W / 16) * 16
+        )
+
+        pad_h = H_pad - H
+        pad_w = W_pad - W
+
+        blur_pad = F.pad(
+            blur,
+            (0, pad_w, 0, pad_h),
+            mode="replicate"
+        )
+
+        # ----------------------------------------------------
+        # 2. DA 图上采样到原始图像尺寸
+        # ----------------------------------------------------
+
+        da_full = F.interpolate(
+            da,
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        da_full = F.pad(
+            da_full,
+            (0, pad_w, 0, pad_h),
+            mode="replicate"
+        )
+
+        # ----------------------------------------------------
+        # 3. 原始尺度分支
+        #
+        # Y:   H_pad x W_pad
+        # DA:  H_pad x W_pad
+        #
+        # Encoder 输出:
+        # B x 48 x H_pad/4 x W_pad/4
+        # ----------------------------------------------------
+
+        feat_fine = self.encode_and_stitch(
+            image=blur_pad,
+            da=da_full,
+            encoder=self.encoder_fine,
+            patch_size=self.patch_fine,
+            stride=self.stride_fine
+        )
+
+        # ----------------------------------------------------
+        # 4. 4 倍下采样分支
+        #
+        # 不使用 2 倍尺度
+        # ----------------------------------------------------
+
+        H4 = H_pad // 4
+        W4 = W_pad // 4
+
+        blur_4 = F.interpolate(
+            blur_pad,
+            size=(H4, W4),
+            mode="area"
+        )
+
+        da_4 = F.interpolate(
+            da_full,
+            size=(H4, W4),
+            mode="area"
+        )
+
+        # Encoder 输出:
+        # B x 48 x H_pad/16 x W_pad/16
+        feat_coarse = self.encode_and_stitch(
+            image=blur_4,
+            da=da_4,
+            encoder=self.encoder_coarse,
+            patch_size=self.patch_coarse,
+            stride=self.stride_coarse
+        )
+
+        # ----------------------------------------------------
+        # 5. 多尺度特征融合
+        #
+        # 将 4 倍尺度特征放大到原始分支特征尺寸
+        # ----------------------------------------------------
+
+        feat_fine = self.fine_proj(feat_fine)
+
+        feat_coarse = self.coarse_proj(feat_coarse)
+
+        feat_coarse = F.interpolate(
+            feat_coarse,
+            size=feat_fine.shape[-2:],
+            mode="bilinear",
+            align_corners=False
+        )
+
+        fused = torch.cat(
+            [feat_fine, feat_coarse],
+            dim=1
+        )
+
+        fused = self.fusion(fused)
+
+        # ----------------------------------------------------
+        # 6. 预测 K、B
+        #
+        # 当前初始化时 K=1, B=0
+        # ----------------------------------------------------
+
+        pred = self.head(fused)
+
+        k_delta = pred[:, 0:1]
+        b_pred = pred[:, 1:2]
+
+        K = 1.0 + k_delta
+        B_map = b_pred
+
+        # ----------------------------------------------------
+        # 7. 上采样到原始分辨率
+        # ----------------------------------------------------
+
+        K = F.interpolate(
+            K,
+            size=(H_pad, W_pad),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        B_map = F.interpolate(
+            B_map,
+            size=(H_pad, W_pad),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        # ----------------------------------------------------
+        # 8. 深度校准
+        # ----------------------------------------------------
+
+        depth = K * da_full + B_map
+
+        # 去除 padding
+        depth = depth[:, :, :H, :W]
+        K = K[:, :, :H, :W]
+        B_map = B_map[:, :, :H, :W]
+
+        return {
+            "depth": depth,
+            "K": K,
+            "B": B_map
+        }
