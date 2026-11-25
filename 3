@@ -1,0 +1,743 @@
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# 基础卷积模块
+# ============================================================
+
+class ConvBlock(nn.Module):
+
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(
+            in_ch, out_ch,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False
+        )
+
+        self.norm1 = nn.GroupNorm(8, out_ch)
+
+        self.conv2 = nn.Conv2d(
+            out_ch, out_ch,
+            kernel_size=3,
+            padding=1,
+            bias=False
+        )
+
+        self.norm2 = nn.GroupNorm(8, out_ch)
+
+        self.act = nn.GELU()
+
+    def forward(self, x):
+
+        x = self.act(self.norm1(self.conv1(x)))
+        x = self.act(self.norm2(self.conv2(x)))
+
+        return x
+
+
+# ============================================================
+# Patch Encoder
+#
+# 输入:
+#   [B, 2*N, P, P]
+#
+# 通道排列:
+#   Y1, DA1, Y2, DA2, ..., YN, DAN
+#
+# 每个patch使用相同的卷积权重
+# 两个尺度分别实例化，因此尺度之间不共享权重
+#
+# 输出:
+#   [B, N, C, P/4, P/4]
+# ============================================================
+
+class PatchEncoder(nn.Module):
+
+    def __init__(
+        self,
+        in_ch=2,
+        base_ch=32,
+        out_ch=8,
+        num_heads=2
+    ):
+        super().__init__()
+
+        self.in_ch = in_ch
+        self.base_ch = base_ch
+        self.out_ch = out_ch
+
+        self.conv1 = nn.Conv2d(
+            in_ch, base_ch,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False
+        )
+
+        self.norm1 = nn.GroupNorm(8, base_ch)
+
+        self.conv2 = nn.Conv2d(
+            base_ch, out_ch,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False
+        )
+
+        self.norm2 = nn.GroupNorm(4, out_ch)
+
+        self.conv3 = nn.Conv2d(
+            out_ch, out_ch,
+            kernel_size=3,
+            padding=1,
+            bias=False
+        )
+
+        self.norm3 = nn.GroupNorm(4, out_ch)
+
+        # patch之间的全局特征交互
+        self.attention = nn.MultiheadAttention(
+            embed_dim=out_ch,
+            num_heads=num_heads,
+            batch_first=True
+        )
+
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(2, out_ch),
+            nn.GELU(),
+            nn.Linear(out_ch, out_ch)
+        )
+
+    @staticmethod
+    def grouped_conv(x, conv, n):
+
+        weight = conv.weight.repeat(n, 1, 1, 1)
+
+        bias = None
+
+        if conv.bias is not None:
+            bias = conv.bias.repeat(n)
+
+        return F.conv2d(
+            x,
+            weight,
+            bias,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
+            groups=n
+        )
+
+    @staticmethod
+    def patch_norm(x, norm, B, N, C):
+
+        _, _, H, W = x.shape
+
+        x = x.reshape(B, N, C, H, W)
+
+        x = x.reshape(B * N, C, H, W)
+
+        x = norm(x)
+
+        x = x.reshape(B, N, C, H, W)
+
+        return x.reshape(B, N * C, H, W)
+
+    def forward(self, x, coords):
+
+        B, total_ch, P, _ = x.shape
+
+        N = total_ch // 2
+
+        # ----------------------------------------
+        # 第一次下采样: P -> P/2
+        # ----------------------------------------
+
+        x = self.grouped_conv(
+            x, self.conv1, N
+        )
+
+        x = self.patch_norm(
+            x, self.norm1,
+            B, N, self.base_ch
+        )
+
+        x = F.gelu(x)
+
+        # ----------------------------------------
+        # 第二次下采样: P/2 -> P/4
+        # ----------------------------------------
+
+        x = self.grouped_conv(
+            x, self.conv2, N
+        )
+
+        x = self.patch_norm(
+            x, self.norm2,
+            B, N, self.out_ch
+        )
+
+        x = F.gelu(x)
+
+        # ----------------------------------------
+        # 特征细化
+        # ----------------------------------------
+
+        x = self.grouped_conv(
+            x, self.conv3, N
+        )
+
+        x = self.patch_norm(
+            x, self.norm3,
+            B, N, self.out_ch
+        )
+
+        x = F.gelu(x)
+
+        # [B, N, C, h, w]
+        h, w = x.shape[-2:]
+
+        x = x.reshape(
+            B, N, self.out_ch, h, w
+        )
+
+        # ----------------------------------------
+        # Patch全局特征交互
+        # ----------------------------------------
+
+        tokens = x.mean(dim=(-2, -1))
+
+        # coords: [N, 2]
+        pos = self.pos_mlp(coords)
+
+        tokens = tokens + pos.unsqueeze(0)
+
+        context, _ = self.attention(
+            tokens, tokens, tokens,
+            need_weights=False
+        )
+
+        # 将全局上下文加回每个patch
+        x = x + context[:, :, :, None, None]
+
+        return x
+
+
+# ============================================================
+# 完整多尺度深度重建网络
+# ============================================================
+
+class MultiScaleDepthNet(nn.Module):
+
+    def __init__(
+        self,
+        patch_size=1024,
+        stride=768,
+        feature_ch=8,
+        fusion_ch=32
+    ):
+        super().__init__()
+
+        self.patch_size = patch_size
+        self.stride = stride
+
+        self.low_patch_size = patch_size // 4
+        self.low_stride = stride // 4
+
+        self.feature_ch = feature_ch
+
+        # 两个尺度完全独立的Encoder
+        self.encoder_fine = PatchEncoder(
+            out_ch=feature_ch
+        )
+
+        self.encoder_coarse = PatchEncoder(
+            out_ch=feature_ch
+        )
+
+        # 高低尺度对应patch融合
+        self.patch_fusion = nn.Sequential(
+            ConvBlock(
+                feature_ch * 2,
+                fusion_ch
+            ),
+
+            ConvBlock(
+                fusion_ch,
+                fusion_ch
+            )
+        )
+
+        # 最终K、B预测
+        self.head = nn.Sequential(
+            ConvBlock(
+                fusion_ch,
+                fusion_ch
+            ),
+
+            nn.Conv2d(
+                fusion_ch,
+                2,
+                kernel_size=1
+            )
+        )
+
+        # 初始化: K=1, B=0
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+
+    # ========================================================
+    # 将尺寸补齐到规则滑窗网格
+    #
+    # 保证两个尺度的patch坐标完全对应
+    # ========================================================
+
+    def get_padded_size(self, H, W):
+
+        P = self.patch_size
+        S = self.stride
+
+        H_pad = P + math.ceil(
+            max(0, H - P) / S
+        ) * S
+
+        W_pad = P + math.ceil(
+            max(0, W - P) / S
+        ) * S
+
+        return H_pad, W_pad
+
+    # ========================================================
+    # 获取规则patch坐标
+    # ========================================================
+
+    @staticmethod
+    def get_coords(H, W, P, S, device):
+
+        ys = list(range(0, H - P + 1, S))
+        xs = list(range(0, W - P + 1, S))
+
+        coords = []
+
+        for y in ys:
+            for x in xs:
+
+                cy = (y + P / 2) / H
+                cx = (x + P / 2) / W
+
+                coords.append([cy, cx])
+
+        coords = torch.tensor(
+            coords,
+            device=device,
+            dtype=torch.float32
+        )
+
+        return coords, len(ys), len(xs)
+
+    # ========================================================
+    # 按通道切块
+    #
+    # [B,1,H,W]
+    #       ->
+    # [B,N,P,P]
+    # ========================================================
+
+    @staticmethod
+    def crop_to_channels(x, patch_size, stride):
+
+        B, C, H, W = x.shape
+
+        patches = F.unfold(
+            x,
+            kernel_size=patch_size,
+            stride=stride
+        )
+
+        N = patches.shape[-1]
+
+        patches = patches.transpose(1, 2)
+
+        patches = patches.reshape(
+            B, N, C,
+            patch_size,
+            patch_size
+        )
+
+        return patches
+
+    # ========================================================
+    # Y和DA交错拼接
+    #
+    # [B,N,P,P] + [B,N,P,P]
+    #       ->
+    # [B,2N,P,P]
+    #
+    # Y1,DA1,Y2,DA2,...
+    # ========================================================
+
+    @staticmethod
+    def merge_patch_channels(y_patch, da_patch):
+
+        x = torch.stack(
+            [y_patch, da_patch],
+            dim=2
+        )
+
+        B, N, _, P, _ = x.shape
+
+        return x.reshape(
+            B, 2 * N, P, P
+        )
+
+    # ========================================================
+    # Patch特征重叠拼接
+    #
+    # patches:
+    # [B,N,C,Pf,Pf]
+    #
+    # return:
+    # [B,C,Hf,Wf]
+    # ========================================================
+
+    @staticmethod
+    def fold_features(
+        patches,
+        output_size,
+        stride,
+        window
+    ):
+
+        B, N, C, P, _ = patches.shape
+
+        H, W = output_size
+
+        # [B,N,C,P,P]
+        patches = patches * window
+
+        # F.fold输入:
+        # [B,C*P*P,N]
+
+        patches = patches.permute(
+            0, 2, 3, 4, 1
+        ).reshape(
+            B, C * P * P, N
+        )
+
+        output = F.fold(
+            patches,
+            output_size=(H, W),
+            kernel_size=P,
+            stride=stride
+        )
+
+        # 权重累积
+        weight_patch = window[0, 0]
+
+        weight_patch = weight_patch.reshape(
+            1, P * P, 1
+        )
+
+        weight_patch = weight_patch.expand(
+            B, P * P, N
+        )
+
+        weight_sum = F.fold(
+            weight_patch,
+            output_size=(H, W),
+            kernel_size=P,
+            stride=stride
+        )
+
+        output = output / weight_sum.clamp_min(1e-6)
+
+        return output
+
+    # ========================================================
+    # Forward
+    #
+    # blur: [B,1,H,W]
+    # da:   [B,1,518,518]
+    #
+    # return:
+    # depth, K, B
+    # ========================================================
+
+    def forward(self, blur, da):
+
+        B, _, H, W = blur.shape
+
+        P = self.patch_size
+        S = self.stride
+
+        device = blur.device
+
+        # ----------------------------------------
+        # 1. 原始图像padding
+        # ----------------------------------------
+
+        H_pad, W_pad = self.get_padded_size(H, W)
+
+        blur_pad = F.pad(
+            blur,
+            (
+                0, W_pad - W,
+                0, H_pad - H
+            ),
+            mode="replicate"
+        )
+
+        # ----------------------------------------
+        # 2. DA恢复到原图坐标
+        # ----------------------------------------
+
+        da_full = F.interpolate(
+            da,
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        da_pad = F.pad(
+            da_full,
+            (
+                0, W_pad - W,
+                0, H_pad - H
+            ),
+            mode="replicate"
+        )
+
+        # ----------------------------------------
+        # 3. 生成高尺度patch
+        # ----------------------------------------
+
+        y1 = self.crop_to_channels(
+            blur_pad,
+            P,
+            S
+        )
+
+        da1 = self.crop_to_channels(
+            da_pad,
+            P,
+            S
+        )
+
+        x1 = self.merge_patch_channels(
+            y1, da1
+        )
+
+        # ----------------------------------------
+        # 4. 生成低尺度图像
+        # ----------------------------------------
+
+        blur4 = F.interpolate(
+            blur_pad,
+            size=(H_pad // 4, W_pad // 4),
+            mode="area"
+        )
+
+        da4 = F.interpolate(
+            da_pad,
+            size=(H_pad // 4, W_pad // 4),
+            mode="area"
+        )
+
+        P4 = P // 4
+        S4 = S // 4
+
+        # ----------------------------------------
+        # 5. 生成低尺度patch
+        #
+        # patch数量和高尺度完全一致
+        # ----------------------------------------
+
+        y2 = self.crop_to_channels(
+            blur4,
+            P4,
+            S4
+        )
+
+        da2 = self.crop_to_channels(
+            da4,
+            P4,
+            S4
+        )
+
+        x2 = self.merge_patch_channels(
+            y2, da2
+        )
+
+        # ----------------------------------------
+        # 6. 生成位置编码
+        # ----------------------------------------
+
+        coords, grid_h, grid_w = self.get_coords(
+            H_pad,
+            W_pad,
+            P,
+            S,
+            device
+        )
+
+        # ----------------------------------------
+        # 7. 两个尺度独立提取特征
+        # ----------------------------------------
+
+        feat1 = self.encoder_fine(
+            x1,
+            coords
+        )
+
+        feat2 = self.encoder_coarse(
+            x2,
+            coords
+        )
+
+        # feat1:
+        # [B,N,C,P/4,P/4]
+        #
+        # feat2:
+        # [B,N,C,P/16,P/16]
+
+        # ----------------------------------------
+        # 8. 低尺度特征逐patch上采样4倍
+        # ----------------------------------------
+
+        N = feat1.shape[1]
+
+        h1 = feat1.shape[-2]
+        w1 = feat1.shape[-1]
+
+        feat2 = feat2.reshape(
+            B * N,
+            self.feature_ch,
+            feat2.shape[-2],
+            feat2.shape[-1]
+        )
+
+        feat2 = F.interpolate(
+            feat2,
+            size=(h1, w1),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        feat2 = feat2.reshape(
+            B, N,
+            self.feature_ch,
+            h1, w1
+        )
+
+        # ----------------------------------------
+        # 9. 对应patch特征融合
+        # ----------------------------------------
+
+        feat1_flat = feat1.reshape(
+            B * N,
+            self.feature_ch,
+            h1, w1
+        )
+
+        feat2_flat = feat2.reshape(
+            B * N,
+            self.feature_ch,
+            h1, w1
+        )
+
+        fused = torch.cat(
+            [feat1_flat, feat2_flat],
+            dim=1
+        )
+
+        fused = self.patch_fusion(fused)
+
+        fusion_ch = fused.shape[1]
+
+        fused = fused.reshape(
+            B, N,
+            fusion_ch,
+            h1, w1
+        )
+
+        # ----------------------------------------
+        # 10. Hann窗口加权
+        # ----------------------------------------
+
+        win = torch.hann_window(
+            h1,
+            periodic=False,
+            device=device,
+            dtype=fused.dtype
+        ).clamp_min(0.05)
+
+        window = (
+            win[:, None] * win[None, :]
+        )[None, None]
+
+        # ----------------------------------------
+        # 11. F.fold恢复整张特征图
+        # ----------------------------------------
+
+        Hf = H_pad // 4
+        Wf = W_pad // 4
+
+        stride_f = S // 4
+
+        fused_map = self.fold_features(
+            fused,
+            output_size=(Hf, Wf),
+            stride=stride_f,
+            window=window
+        )
+
+        # ----------------------------------------
+        # 12. 预测K、B
+        # ----------------------------------------
+
+        pred = self.head(fused_map)
+
+        k_delta = pred[:, 0:1]
+        b_map = pred[:, 1:2]
+
+        K = 1.0 + k_delta
+        B_map = b_map
+
+        # ----------------------------------------
+        # 13. 上采样到原图大小
+        # ----------------------------------------
+
+        K = F.interpolate(
+            K,
+            size=(H_pad, W_pad),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        B_map = F.interpolate(
+            B_map,
+            size=(H_pad, W_pad),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        depth = K * da_pad + B_map
+
+        # 去掉padding
+        depth = depth[:, :, :H, :W]
+        K = K[:, :, :H, :W]
+        B_map = B_map[:, :, :H, :W]
+
+        return {
+            "depth": depth,
+            "K": K,
+            "B": B_map
+        }
