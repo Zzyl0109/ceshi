@@ -1,4 +1,248 @@
 
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# 基础卷积模块
+# ============================================================
+
+class ConvBlock(nn.Module):
+
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(
+            in_ch, out_ch,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            bias=False
+        )
+
+        self.norm1 = nn.GroupNorm(8, out_ch)
+
+        self.conv2 = nn.Conv2d(
+            out_ch, out_ch,
+            kernel_size=3,
+            padding=1,
+            bias=False
+        )
+
+        self.norm2 = nn.GroupNorm(8, out_ch)
+
+        self.act = nn.GELU()
+
+    def forward(self, x):
+
+        x = self.act(self.norm1(self.conv1(x)))
+        x = self.act(self.norm2(self.conv2(x)))
+
+        return x
+
+
+# ============================================================
+# Patch Encoder
+#
+# 输入:
+#   [B, 2*N, P, P]
+#
+# 通道排列:
+#   Y1, DA1, Y2, DA2, ..., YN, DAN
+#
+# 每个patch使用相同的卷积权重
+# 两个尺度分别实例化，因此尺度之间不共享权重
+#
+# 输出:
+#   [B, N, C, P/4, P/4]
+# ============================================================
+
+class PatchEncoder(nn.Module):
+
+    def __init__(
+        self,
+        in_ch=2,
+        base_ch=32,
+        out_ch=8,
+        num_heads=2
+    ):
+        super().__init__()
+
+        self.in_ch = in_ch
+        self.base_ch = base_ch
+        self.out_ch = out_ch
+
+        self.conv1 = nn.Conv2d(
+            in_ch, base_ch,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False
+        )
+
+        self.norm1 = nn.GroupNorm(8, base_ch)
+
+        self.conv2 = nn.Conv2d(
+            base_ch, out_ch,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=False
+        )
+
+        self.norm2 = nn.GroupNorm(4, out_ch)
+
+        self.conv3 = nn.Conv2d(
+            out_ch, out_ch,
+            kernel_size=3,
+            padding=1,
+            bias=False
+        )
+
+        self.norm3 = nn.GroupNorm(4, out_ch)
+
+        # patch之间的全局特征交互
+        self.attention = nn.MultiheadAttention(
+            embed_dim=out_ch,
+            num_heads=num_heads,
+            batch_first=True
+        )
+
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(2, out_ch),
+            nn.GELU(),
+            nn.Linear(out_ch, out_ch)
+        )
+
+    @staticmethod
+    def grouped_conv(x, conv, n):
+
+        weight = conv.weight.repeat(n, 1, 1, 1)
+
+        bias = None
+
+        if conv.bias is not None:
+            bias = conv.bias.repeat(n)
+
+        return F.conv2d(
+            x,
+            weight,
+            bias,
+            stride=conv.stride,
+            padding=conv.padding,
+            dilation=conv.dilation,
+            groups=n
+        )
+
+    @staticmethod
+    def patch_norm(x, norm, B, N, C):
+
+        _, _, H, W = x.shape
+
+        x = x.reshape(B, N, C, H, W)
+
+        x = x.reshape(B * N, C, H, W)
+
+        x = norm(x)
+
+        x = x.reshape(B, N, C, H, W)
+
+        return x.reshape(B, N * C, H, W)
+
+    def forward(self, x, coords):
+
+        B, total_ch, P, _ = x.shape
+
+        N = total_ch // 2
+
+        # ----------------------------------------
+        # 第一次下采样: P -> P/2
+        # ----------------------------------------
+
+        x = self.grouped_conv(
+            x, self.conv1, N
+        )
+
+        x = self.patch_norm(
+            x, self.norm1,
+            B, N, self.base_ch
+        )
+
+        x = F.gelu(x)
+
+        # ----------------------------------------
+        # 第二次下采样: P/2 -> P/4
+        # ----------------------------------------
+
+        x = self.grouped_conv(
+            x, self.conv2, N
+        )
+
+        x = self.patch_norm(
+            x, self.norm2,
+            B, N, self.out_ch
+        )
+
+        x = F.gelu(x)
+
+        # ----------------------------------------
+        # 特征细化
+        # ----------------------------------------
+
+        x = self.grouped_conv(
+            x, self.conv3, N
+        )
+
+        x = self.patch_norm(
+            x, self.norm3,
+            B, N, self.out_ch
+        )
+
+        x = F.gelu(x)
+
+        # [B, N, C, h, w]
+        h, w = x.shape[-2:]
+
+        x = x.reshape(
+            B, N, self.out_ch, h, w
+        )
+
+        # ----------------------------------------
+        # Patch全局特征交互
+        # ----------------------------------------
+
+        tokens = x.mean(dim=(-2, -1))
+
+        # coords: [N, 2]
+        pos = self.pos_mlp(coords)
+
+        tokens = tokens + pos.unsqueeze(0)
+
+        context, _ = self.attention(
+            tokens, tokens, tokens,
+            need_weights=False
+        )
+
+        # 将全局上下文加回每个patch
+        x = x + context[:, :, :, None, None]
+
+        return x
+
+
+# ============================================================
+# 完整多尺度深度重建网络
+# ============================================================
+
+class MultiScaleDepthNet(nn.Module):
+
+    def __init__(
+        self,
+        patch_size=1024,
+        stride=768,
+        feature_ch=8,
+  
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
