@@ -1,0 +1,188 @@
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# 基础卷积模块
+# ============================================================
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv2d(
+                in_channels, out_channels,
+                kernel_size=3, padding=1, bias=False
+            ),
+            nn.GroupNorm(8, out_channels),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+
+        self.conv1 = ConvBlock(channels, channels)
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(
+                channels, channels,
+                kernel_size=3, padding=1, bias=False
+            ),
+            nn.GroupNorm(8, channels)
+        )
+
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(x + self.conv2(self.conv1(x)))
+
+
+# ============================================================
+# 单尺度分块编码器
+# ============================================================
+
+class PatchScaleBranch(nn.Module):
+    def __init__(
+        self,
+        scale,
+        hidden_channels=48,
+        out_channels=2,
+        num_blocks=3
+    ):
+        super().__init__()
+
+        self.scale = scale
+
+        # 模糊图和DA分别PixelUnshuffle后拼接
+        in_channels = 2 * scale * scale
+
+        self.encoder = nn.Sequential(
+            ConvBlock(in_channels, hidden_channels),
+
+            *[
+                ResidualBlock(hidden_channels)
+                for _ in range(num_blocks)
+            ]
+        )
+
+        # 输出 out_channels 个全分辨率特征通道
+        self.decoder = nn.Conv2d(
+            hidden_channels,
+            out_channels * scale * scale,
+            kernel_size=3,
+            padding=1
+        )
+
+        self.pixel_shuffle = nn.PixelShuffle(scale)
+
+    def forward(self, blur, da):
+
+        # [B, 1, H, W]
+        # -> [B, scale^2, H/scale, W/scale]
+        blur_part = F.pixel_unshuffle(
+            blur, self.scale
+        )
+
+        da_part = F.pixel_unshuffle(
+            da, self.scale
+        )
+
+        # 对应位置的模糊图块和DA图块融合
+        x = torch.cat(
+            [blur_part, da_part],
+            dim=1
+        )
+
+        # 分块编码
+        feat = self.encoder(x)
+
+        # 预测分块特征
+        feat = self.decoder(feat)
+
+        # 将通道中的分块信息还原到空间维度
+        feat = self.pixel_shuffle(feat)
+
+        return feat
+
+
+# ============================================================
+# 多尺度全分辨率融合网络
+# ============================================================
+
+class MultiScaleDepthNet(nn.Module):
+    def __init__(
+        self,
+        hidden_channels=48,
+        branch_out_channels=2,
+        num_blocks=3
+    ):
+        super().__init__()
+
+        self.scales = [2, 4, 8]
+
+        # 每个尺度独立编码器
+        self.branches = nn.ModuleList([
+            PatchScaleBranch(
+                scale=s,
+                hidden_channels=hidden_channels,
+                out_channels=branch_out_channels,
+                num_blocks=num_blocks
+            )
+            for s in self.scales
+        ])
+
+        fusion_channels = (
+            len(self.scales) * branch_out_channels
+        )
+
+        # 全分辨率融合
+        self.fusion = nn.Sequential(
+            ConvBlock(fusion_channels, 32),
+            ResidualBlock(32),
+            ConvBlock(32, 16),
+            nn.Conv2d(16, 1, kernel_size=3, padding=1)
+        )
+
+    def forward(self, blur, da):
+
+        H, W = blur.shape[-2:]
+
+        # 保证能够被最大尺度8整除
+        pad_h = (8 - H % 8) % 8
+        pad_w = (8 - W % 8) % 8
+
+        blur = F.pad(
+            blur, (0, pad_w, 0, pad_h),
+            mode="replicate"
+        )
+
+        da = F.pad(
+            da, (0, pad_w, 0, pad_h),
+            mode="replicate"
+        )
+
+        # 三个尺度分别编码和解码
+        features = []
+
+        for branch in self.branches:
+            feat = branch(blur, da)
+            features.append(feat)
+
+        # 此时三个特征均为原图分辨率
+        x = torch.cat(features, dim=1)
+
+        # 直接预测绝对深度
+        depth = self.fusion(x)
+
+        # 去掉padding
+        depth = depth[..., :H, :W]
+
+        return depth
