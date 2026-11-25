@@ -1,0 +1,263 @@
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# 基础卷积模块
+# ============================================================
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU(),
+
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(8, out_ch),
+            nn.GELU()
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+# ============================================================
+# 1倍尺度编码器
+# 输入: [B, 2, 896, 896]
+# 输出: [B, 64, 224, 224]
+# ============================================================
+
+class Encoder1x(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Conv2d(2, 32, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(8, 32),
+            nn.GELU(),
+
+            ConvBlock(32, 32),
+
+            nn.Conv2d(32, 64, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+
+            ConvBlock(64, 64)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ============================================================
+# 4倍尺度编码器
+# 输入: [B, 2, 224, 224]
+# 输出: [B, 64, 224, 224]
+# ============================================================
+
+class Encoder4x(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            ConvBlock(2, 32),
+            nn.Conv2d(32, 64, 3, padding=1, bias=False),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            ConvBlock(64, 64)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ============================================================
+# 多尺度特征融合
+# ============================================================
+
+class FusionBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.fusion = nn.Sequential(
+            nn.Conv2d(128, 64, 1, bias=False),
+            nn.GroupNorm(8, 64),
+            nn.GELU(),
+            ConvBlock(64, 64)
+        )
+
+    def forward(self, f1, f4):
+
+        x = torch.cat([f1, f4], dim=1)
+
+        return self.fusion(x)
+
+
+# ============================================================
+# 解码器
+# 输入: [B, 64, 224, 224]
+# 输出: [B, 1, 896, 896]
+# ============================================================
+
+class Decoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.block1 = ConvBlock(64, 64)
+        self.block2 = ConvBlock(64, 32)
+
+        self.head = nn.Conv2d(32, 1, 1)
+
+    def forward(self, x):
+
+        x = self.block1(x)
+
+        x = F.interpolate(
+            x,
+            scale_factor=2,
+            mode="bilinear",
+            align_corners=False
+        )
+
+        x = self.block2(x)
+
+        x = F.interpolate(
+            x,
+            scale_factor=2,
+            mode="bilinear",
+            align_corners=False
+        )
+
+        x = self.head(x)
+
+        return x
+
+
+# ============================================================
+# 完整网络
+# ============================================================
+
+class MultiScaleDepthNet(nn.Module):
+    def __init__(self, patch_size=896):
+        super().__init__()
+
+        assert patch_size % 4 == 0
+
+        self.patch_size = patch_size
+
+        self.encoder1x = Encoder1x()
+        self.encoder4x = Encoder4x()
+
+        self.fusion = FusionBlock()
+        self.decoder = Decoder()
+
+    def forward(self, blur, da):
+
+        # blur, da: [B, 1, H, W]
+
+        B, _, H, W = blur.shape
+        P = self.patch_size
+
+        assert da.shape[-2:] == (H, W)
+
+        # ----------------------------------------------------
+        # 1. 补齐到 patch_size 的整数倍
+        # ----------------------------------------------------
+
+        Hp = ((H + P - 1) // P) * P
+        Wp = ((W + P - 1) // P) * P
+
+        pad_h = Hp - H
+        pad_w = Wp - W
+
+        blur = F.pad(blur, (0, pad_w, 0, pad_h), mode="replicate")
+        da = F.pad(da, (0, pad_w, 0, pad_h), mode="replicate")
+
+        # ----------------------------------------------------
+        # 2. 分块
+        # ----------------------------------------------------
+
+        blur_patches = F.unfold(
+            blur, kernel_size=P, stride=P
+        )
+
+        da_patches = F.unfold(
+            da, kernel_size=P, stride=P
+        )
+
+        N = blur_patches.shape[-1]
+
+        blur_patches = blur_patches.transpose(1, 2).reshape(
+            B * N, 1, P, P
+        )
+
+        da_patches = da_patches.transpose(1, 2).reshape(
+            B * N, 1, P, P
+        )
+
+        # ----------------------------------------------------
+        # 3. 1倍尺度：原始分块
+        # ----------------------------------------------------
+
+        x1 = torch.cat(
+            [blur_patches, da_patches], dim=1
+        )
+
+        f1 = self.encoder1x(x1)
+
+        # ----------------------------------------------------
+        # 4. 4倍尺度：同一块区域下采样
+        # ----------------------------------------------------
+
+        blur4 = F.avg_pool2d(
+            blur_patches, kernel_size=4, stride=4
+        )
+
+        da4 = F.avg_pool2d(
+            da_patches, kernel_size=4, stride=4
+        )
+
+        x4 = torch.cat([blur4, da4], dim=1)
+
+        f4 = self.encoder4x(x4)
+
+        # ----------------------------------------------------
+        # 5. 同一块、同一视场进行特征融合
+        # ----------------------------------------------------
+
+        fused = self.fusion(f1, f4)
+
+        # ----------------------------------------------------
+        # 6. 输出与原始输入块相同大小的深度图
+        # ----------------------------------------------------
+
+        pred_patches = self.decoder(fused)
+
+        # ----------------------------------------------------
+        # 7. 拼接回整图
+        # ----------------------------------------------------
+
+        pred_patches = pred_patches.reshape(
+            B, N, 1, P, P
+        )
+
+        pred_patches = pred_patches.reshape(
+            B, N, P * P
+        ).transpose(1, 2)
+
+        pred = F.fold(
+            pred_patches,
+            output_size=(Hp, Wp),
+            kernel_size=P,
+            stride=P
+        )
+
+        # 去掉补齐部分
+        pred = pred[:, :, :H, :W]
+
+        return pred
