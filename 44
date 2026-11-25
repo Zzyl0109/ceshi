@@ -1,0 +1,821 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ============================================================
+# 1. 自动生成切块坐标
+#    原图：896 × 896
+#    4倍下采样图：224 × 224
+#    两个尺度使用完全对应的坐标
+# ============================================================
+
+def get_patch_positions(H, W, patch_size):
+    """
+    不padding，覆盖整张图。
+    均匀分布切块起始位置，允许patch之间重叠。
+    """
+    num_h = math.ceil(H / patch_size)
+    num_w = math.ceil(W / patch_size)
+
+    if num_h == 1:
+        y_stats = [0]
+    else:
+        y_stats = torch.linspace(
+            0, H - patch_size, num_h
+        ).round().long().tolist()
+
+    if num_w == 1:
+        x_stats = [0]
+    else:
+        x_stats = torch.linspace(
+            0, W - patch_size, num_w
+        ).round().long().tolist()
+
+    return [(y, x) for y in y_stats for x in x_stats]
+
+
+# ============================================================
+# 2. 将patch维度放到通道维度
+# ============================================================
+
+def patch_to_channels(x, positions, patch_size):
+    """
+    x: [B,C,H,W]
+
+    return:
+        [B,N*C,P,P]
+
+    通道排列：
+        patch1的全部通道
+        patch2的全部通道
+        ...
+    """
+    B, C, H, W = x.shape
+
+    patches = []
+
+    for y, x0 in positions:
+        patch = x[
+            :, :, y:y + patch_size, x0:x0 + patch_size
+        ]
+        patches.append(patch)
+
+    patches = torch.stack(patches, dim=1)
+
+    return patches.reshape(
+        B, len(positions) * C, patch_size, patch_size
+    )
+
+
+# ============================================================
+# 3. 通道维度还原成patch维度
+# ============================================================
+
+def channels_to_patches(x, num_patches, channels):
+    """
+    x: [B,N*C,H,W]
+
+    return:
+        [B,N,C,H,W]
+    """
+    B, _, H, W = x.shape
+
+    return x.reshape(
+        B, num_patches, channels, H, W
+    )
+
+
+# ============================================================
+# 4. 生成位置坐标图
+# ============================================================
+
+def make_position_maps(
+    positions,
+    patch_size,
+    original_h,
+    original_w,
+    device,
+    scale=1
+):
+    """
+    return: [N,2,P,P]
+
+    第0通道：纵坐标
+    第1通道：横坐标
+    """
+
+    yy = torch.arange(
+        patch_size, device=device, dtype=torch.float32
+    )
+
+    xx = torch.arange(
+        patch_size, device=device, dtype=torch.float32
+    )
+
+    position_maps = []
+
+    for y0, x0 in positions:
+
+        y_coord = (yy * scale + y0 * scale) / original_h
+        x_coord = (xx * scale + x0 * scale) / original_w
+
+        pos = torch.empty(
+            2, patch_size, patch_size,
+            device=device,
+            dtype=torch.float32
+        )
+
+        pos[0] = y_coord[:, None].expand(-1, patch_size)
+        pos[1] = x_coord[None, :].expand(patch_size, -1)
+
+        position_maps.append(pos)
+
+    return torch.stack(position_maps, dim=0)
+
+
+# ============================================================
+# 5. 将不同尺度特征按patch对应关系融合
+# ============================================================
+
+def concat_patch_features(x1, x2, num_patches, c1, c2):
+    """
+    x1: [B,N*C1,H,W]
+    x2: [B,N*C2,H,W]
+
+    return: [B,N*(C1+C2),H,W]
+
+    注意：每个patch内部拼接特征通道，
+    不会把不同patch的特征混在一起。
+    """
+
+    B, _, H, W = x1.shape
+
+    x1 = x1.reshape(B, num_patches, c1, H, W)
+    x2 = x2.reshape(B, num_patches, c2, H, W)
+
+    x = torch.cat([x1, x2], dim=2)
+
+    return x.reshape(
+        B, num_patches * (c1 + c2), H, W
+    )
+
+
+# ============================================================
+# 6. 分组卷积模块
+#    每个patch独立使用同一套卷积权重
+# ============================================================
+
+class PatchConvBlock(nn.Module):
+
+    def __init__(
+        self,
+        in_ch,
+        out_ch,
+        num_patches,
+        kernel_size=3,
+        stride=1,
+        padding=1
+    ):
+        super().__init__()
+
+        self.in_ch = in_ch
+        self.out_ch = out_ch
+        self.num_patches = num_patches
+
+        self.conv = nn.Conv2d(
+            in_ch * num_patches,
+            out_ch * num_patches,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=num_patches,
+            bias=False
+        )
+
+        self.norm = nn.GroupNorm(4, out_ch)
+        self.act = nn.GELU()
+
+    def forward(self, x):
+
+        B = x.shape[0]
+
+        x = self.conv(x)
+
+        _, _, H, W = x.shape
+
+        x = x.reshape(
+            B * self.num_patches,
+            self.out_ch,
+            H,
+            W
+        )
+
+        x = self.norm(x)
+        x = self.act(x)
+
+        x = x.reshape(
+            B,
+            self.num_patches * self.out_ch,
+            H,
+            W
+        )
+
+        return x
+
+
+# ============================================================
+# 7. 原始尺度特征提取
+#    896 -> 224
+# ============================================================
+
+class HighScaleEncoder(nn.Module):
+
+    def __init__(self, num_patches, feature_ch=32):
+
+        super().__init__()
+
+        self.block1 = PatchConvBlock(
+            4, 16, num_patches,
+            kernel_size=7,
+            stride=4,
+            padding=3
+        )
+
+        self.block2 = PatchConvBlock(
+            16, feature_ch, num_patches
+        )
+
+        self.block3 = PatchConvBlock(
+            feature_ch, feature_ch, num_patches
+        )
+
+    def forward(self, x):
+
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+
+        return x
+
+
+# ============================================================
+# 8. 四倍下采样尺度特征提取
+#    224 -> 56
+# ============================================================
+
+class LowScaleEncoder(nn.Module):
+
+    def __init__(self, num_patches, feature_ch=32):
+
+        super().__init__()
+
+        self.block1 = PatchConvBlock(
+            4, 16, num_patches,
+            kernel_size=7,
+            stride=4,
+            padding=3
+        )
+
+        self.block2 = PatchConvBlock(
+            16, feature_ch, num_patches
+        )
+
+        self.block3 = PatchConvBlock(
+            feature_ch, feature_ch, num_patches
+        )
+
+    def forward(self, x):
+
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+
+        return x
+
+
+# ============================================================
+# 9. 双尺度特征融合
+#    高尺度：224 × 224
+#    低尺度：56 × 56 -> 224 × 224
+# ============================================================
+
+class MultiScaleFusion(nn.Module):
+
+    def __init__(self, num_patches, feature_ch=32):
+
+        super().__init__()
+
+        self.fusion1 = PatchConvBlock(
+            feature_ch * 2,
+            feature_ch,
+            num_patches,
+            kernel_size=1,
+            padding=0
+        )
+
+        self.fusion2 = PatchConvBlock(
+            feature_ch,
+            feature_ch,
+            num_patches
+        )
+
+        self.fusion3 = PatchConvBlock(
+            feature_ch,
+            feature_ch,
+            num_patches
+        )
+
+    def forward(self, high_feat, low_feat):
+
+        B, _, H, W = high_feat.shape
+
+        # 低尺度特征上采样4倍
+        low_feat = F.interpolate(
+            low_feat,
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        # 对应patch的特征通道进行拼接
+        x = concat_patch_features(
+            high_feat,
+            low_feat,
+            self.num_patches,
+            self.feature_ch,
+            self.feature_ch
+        ) if False else None
+
+        return x
+
+
+# ============================================================
+# 10. 特征融合模块（实际使用版本）
+# ============================================================
+
+class MultiScaleFusion(nn.Module):
+
+    def __init__(self, num_patches, feature_ch=32):
+
+        super().__init__()
+
+        self.num_patches = num_patches
+        self.feature_ch = feature_ch
+
+        self.fusion1 = PatchConvBlock(
+            feature_ch * 2,
+            feature_ch,
+            num_patches,
+            kernel_size=1,
+            padding=0
+        )
+
+        self.fusion2 = PatchConvBlock(
+            feature_ch,
+            feature_ch,
+            num_patches
+        )
+
+        self.fusion3 = PatchConvBlock(
+            feature_ch,
+            feature_ch,
+            num_patches
+        )
+
+    def forward(self, high_feat, low_feat):
+
+        B, _, H, W = high_feat.shape
+
+        low_feat = F.interpolate(
+            low_feat,
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        x = concat_patch_features(
+            high_feat,
+            low_feat,
+            self.num_patches,
+            self.feature_ch,
+            self.feature_ch
+        )
+
+        x = self.fusion1(x)
+        x = self.fusion2(x)
+        x = self.fusion3(x)
+
+        return x
+
+
+# ============================================================
+# 11. Patch解码器
+#     224 -> 896
+# ============================================================
+
+class PatchDecoder(nn.Module):
+
+    def __init__(self, num_patches, feature_ch=32):
+
+        super().__init__()
+
+        self.num_patches = num_patches
+
+        self.block1 = PatchConvBlock(
+            feature_ch,
+            feature_ch,
+            num_patches
+        )
+
+        self.block2 = PatchConvBlock(
+            feature_ch,
+            16,
+            num_patches
+        )
+
+        self.up = nn.ConvTranspose2d(
+            16 * num_patches,
+            16 * num_patches,
+            kernel_size=4,
+            stride=4,
+            groups=num_patches
+        )
+
+        self.head = nn.Conv2d(
+            16 * num_patches,
+            2 * num_patches,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=num_patches
+        )
+
+    def forward(self, x):
+
+        x = self.block1(x)
+        x = self.block2(x)
+
+        B = x.shape[0]
+
+        x = self.up(x)
+
+        _, _, H, W = x.shape
+
+        x = x.reshape(
+            B * self.num_patches,
+            16,
+            H,
+            W
+        )
+
+        # 逐patch输出K和B
+        x = x.reshape(
+            B,
+            self.num_patches * 16,
+            H,
+            W
+        )
+
+        x = self.head(x)
+
+        return x
+
+
+# ============================================================
+# 12. 重叠区域平均融合
+# ============================================================
+
+def merge_patches(
+    patch_results,
+    positions,
+    original_h,
+    original_w,
+    patch_size,
+    out_channels=2
+):
+    """
+    patch_results: [B,N*C,P,P]
+    return: [B,C,H,W]
+    """
+
+    B = patch_results.shape[0]
+    N = len(positions)
+
+    patches = patch_results.reshape(
+        B, N, out_channels, patch_size, patch_size
+    )
+
+    device = patch_results.device
+
+    sum_map = torch.zeros(
+        B, out_channels, original_h, original_w,
+        device=device,
+        dtype=torch.float32
+    )
+
+    weight_map = torch.zeros(
+        B, 1, original_h, original_w,
+        device=device,
+        dtype=torch.float32
+    )
+
+    for k, (y0, x0) in enumerate(positions):
+
+        pred = patches[:, k].float()
+
+        valid = torch.isfinite(pred).all(
+            dim=1, keepdim=True
+        )
+
+        region = sum_map[
+            :, :, y0:y0 + patch_size, x0:x0 + patch_size
+        ]
+
+        weight_region = weight_map[
+            :, :, y0:y0 + patch_size, x0:x0 + patch_size
+        ]
+
+        region.add_(
+            torch.where(valid, pred, 0.0)
+        )
+
+        weight_region.add_(
+            valid.float()
+        )
+
+    return sum_map / weight_map.clamp_min(1.0)
+
+
+# ============================================================
+# 13. 完整网络
+# ============================================================
+
+class LargeFOVDepthNet(nn.Module):
+
+    def __init__(
+        self,
+        original_h=3672,
+        original_w=5496,
+        high_patch=896,
+        low_patch=224,
+        feature_ch=32
+    ):
+        super().__init__()
+
+        self.original_h = original_h
+        self.original_w = original_w
+
+        self.high_patch = high_patch
+        self.low_patch = low_patch
+
+        self.feature_ch = feature_ch
+
+        self.low_h = original_h // 4
+        self.low_w = original_w // 4
+
+        assert original_h % 4 == 0
+        assert original_w % 4 == 0
+
+        assert high_patch == low_patch * 4
+
+        # 高尺度坐标
+        self.high_positions = get_patch_positions(
+            original_h,
+            original_w,
+            high_patch
+        )
+
+        # 低尺度坐标
+        self.low_positions = get_patch_positions(
+            self.low_h,
+            self.low_w,
+            low_patch
+        )
+
+        # 两个尺度坐标必须严格对应
+        assert len(self.high_positions) == len(self.low_positions)
+
+        for hp, lp in zip(
+            self.high_positions,
+            self.low_positions
+        ):
+            assert hp == (lp[0] * 4, lp[1] * 4)
+
+        self.num_patches = len(self.high_positions)
+
+        self.high_encoder = HighScaleEncoder(
+            self.num_patches,
+            feature_ch
+        )
+
+        self.low_encoder = LowScaleEncoder(
+            self.num_patches,
+            feature_ch
+        )
+
+        self.fusion = MultiScaleFusion(
+            self.num_patches,
+            feature_ch
+        )
+
+        self.decoder = PatchDecoder(
+            self.num_patches,
+            feature_ch
+        )
+
+    def forward(self, y, da):
+
+        """
+        y:  [B,1,3672,5496] 模糊图
+        da: [B,1,3672,5496] DA相对深度图
+
+        return:
+            depth: [B,1,3672,5496]
+            K:     [B,1,3672,5496]
+            b:     [B,1,3672,5496]
+        """
+
+        B, _, H, W = y.shape
+
+        assert H == self.original_h
+        assert W == self.original_w
+        assert da.shape == y.shape
+
+        device = y.device
+
+        # ----------------------------------------------------
+        # A. 原始尺度
+        # ----------------------------------------------------
+
+        high_input = torch.cat(
+            [y, da],
+            dim=1
+        )
+
+        high_patches = patch_to_channels(
+            high_input,
+            self.high_positions,
+            self.high_patch
+        )
+
+        high_pos = make_position_maps(
+            self.high_positions,
+            self.high_patch,
+            H,
+            W,
+            device,
+            scale=1
+        )
+
+        high_pos = high_pos.unsqueeze(0).expand(
+            B, -1, -1, -1, -1
+        )
+
+        high_pos = high_pos.reshape(
+            B,
+            self.num_patches * 2,
+            self.high_patch,
+            self.high_patch
+        )
+
+        high_input = torch.cat(
+            [high_patches, high_pos],
+            dim=1
+        )
+
+        high_feat = self.high_encoder(high_input)
+
+        # ----------------------------------------------------
+        # B. 四倍下采样尺度
+        # ----------------------------------------------------
+
+        low_y = F.avg_pool2d(
+            y,
+            kernel_size=4,
+            stride=4
+        )
+
+        low_da = F.avg_pool2d(
+            da,
+            kernel_size=4,
+            stride=4
+        )
+
+        low_input = torch.cat(
+            [low_y, low_da],
+            dim=1
+        )
+
+        low_patches = patch_to_channels(
+            low_input,
+            self.low_positions,
+            self.low_patch
+        )
+
+        low_pos = make_position_maps(
+            self.low_positions,
+            self.low_patch,
+            H,
+            W,
+            device,
+            scale=4
+        )
+
+        low_pos = low_pos.unsqueeze(0).expand(
+            B, -1, -1, -1, -1
+        )
+
+        low_pos = low_pos.reshape(
+            B,
+            self.num_patches * 2,
+            self.low_patch,
+            self.low_patch
+        )
+
+        low_input = torch.cat(
+            [low_patches, low_pos],
+            dim=1
+        )
+
+        low_feat = self.low_encoder(low_input)
+
+        # ----------------------------------------------------
+        # C. 两个尺度的对应patch特征融合
+        # ----------------------------------------------------
+
+        fused_feat = self.fusion(
+            high_feat,
+            low_feat
+        )
+
+        # ----------------------------------------------------
+        # D. 每个patch预测K和b
+        # ----------------------------------------------------
+
+        patch_results = self.decoder(fused_feat)
+
+        # ----------------------------------------------------
+        # E. 按原始坐标融合所有patch
+        # ----------------------------------------------------
+
+        merged = merge_patches(
+            patch_results,
+            self.high_positions,
+            H,
+            W,
+            self.high_patch,
+            out_channels=2
+        )
+
+        k_delta = merged[:, 0:1]
+        b_map = merged[:, 1:2]
+
+        K = 1.0 + k_delta
+
+        depth = K * da + b_map
+
+        return {
+            "depth": depth,
+            "K": K,
+            "B": b_map
+        }
+
+
+# ============================================================
+# 14. 运行测试
+# ============================================================
+
+if __name__ == "__main__":
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    net = LargeFOVDepthNet(
+        original_h=3672,
+        original_w=5496,
+        high_patch=896,
+        low_patch=224,
+        feature_ch=32
+    ).to(device)
+
+    y = torch.randn(
+        1, 1, 3672, 5496,
+        device=device
+    )
+
+    da = torch.randn(
+        1, 1, 3672, 5496,
+        device=device
+    )
+
+    with torch.no_grad():
+
+        result = net(y, da)
+
+    print("patch数量:", net.num_patches)
+    print("depth:", result["depth"].shape)
+    print("K:", result["K"].shape)
+    print("B:", result["B"].shape)
