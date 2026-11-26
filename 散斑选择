@@ -1,0 +1,170 @@
+import numpy as np
+import torch
+import cv2
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# 输入：你已经搜索得到的最近邻
+# ============================================================
+
+# target_xy: [1, 2]，顺序为 x, y
+# centers_selected: [1, 32, 2] 或 [32, 2]
+# psfs_selected: [1, 32, K, K] 或 [32, K, K]
+
+target = target_xy.detach().cpu().numpy().reshape(2)
+centers = centers_selected.detach().cpu().numpy().reshape(-1, 2)
+psfs = psfs_selected.detach().cpu().numpy().reshape(
+    -1,
+    psfs_selected.shape[-2],
+    psfs_selected.shape[-1]
+)
+
+# ============================================================
+# 1. 相对坐标：target_xy 为原点
+# ============================================================
+
+relative_xy = centers - target[None, :]
+
+# 画布大小
+canvas_size = 1000
+canvas_center = canvas_size // 2
+
+# ============================================================
+# 2. 自动缩放，使32个点都能够放入画布
+# ============================================================
+
+max_dist = np.max(np.abs(relative_xy))
+
+margin = 100
+
+if max_dist > 0:
+    scale = (canvas_center - margin) / max_dist
+else:
+    scale = 1.0
+
+print("缩放比例:", scale)
+
+# 映射至画布坐标
+plot_xy = relative_xy * scale + canvas_center
+
+# ============================================================
+# 3. 将32个PSF放置到同一张图上
+# ============================================================
+
+canvas = np.zeros(
+    (canvas_size, canvas_size),
+    dtype=np.float32
+)
+
+for i in range(len(psfs)):
+
+    psf = psfs[i]
+
+    # 单个PSF归一化，便于比较形态
+    psf = psf.astype(np.float32)
+
+    psf = psf - psf.min()
+
+    if psf.max() > 0:
+        psf = psf / psf.max()
+
+    # 根据空间布局缩放PSF尺寸
+    new_size = max(1, int(psf.shape[0] * scale))
+
+    psf_resized = cv2.resize(
+        psf,
+        (new_size, new_size),
+        interpolation=cv2.INTER_LINEAR
+    )
+
+    # 当前散斑中心在画布上的位置
+    cx, cy = plot_xy[i]
+
+    cx = int(round(cx))
+    cy = int(round(cy))
+
+    half = new_size // 2
+
+    x1 = cx - half
+    y1 = cy - half
+    x2 = x1 + new_size
+    y2 = y1 + new_size
+
+    # 防止越界
+    px1 = max(0, x1)
+    py1 = max(0, y1)
+    px2 = min(canvas_size, x2)
+    py2 = min(canvas_size, y2)
+
+    if px1 >= px2 or py1 >= py2:
+        continue
+
+    psf_x1 = px1 - x1
+    psf_y1 = py1 - y1
+    psf_x2 = psf_x1 + (px2 - px1)
+    psf_y2 = psf_y1 + (py2 - py1)
+
+    # 重叠区域采用最大值显示，避免简单叠加造成亮度过饱和
+    canvas[py1:py2, px1:px2] = np.maximum(
+        canvas[py1:py2, px1:px2],
+        psf_resized[psf_y1:psf_y2, psf_x1:psf_x2]
+    )
+
+
+# ============================================================
+# 4. 展示
+# ============================================================
+
+fig, ax = plt.subplots(figsize=(10, 10), dpi=100)
+
+ax.imshow(
+    canvas,
+    cmap="gray",
+    origin="upper",
+    vmin=0,
+    vmax=1
+)
+
+# 32个散斑中心
+ax.scatter(
+    plot_xy[:, 0],
+    plot_xy[:, 1],
+    s=18,
+    c="cyan",
+    marker="o",
+    label="Neighbor centers"
+)
+
+# 目标中心
+ax.scatter(
+    canvas_center,
+    canvas_center,
+    s=120,
+    c="red",
+    marker="+",
+    linewidths=3,
+    label="Target"
+)
+
+# 编号
+for i in range(len(plot_xy)):
+    ax.text(
+        plot_xy[i, 0] + 5,
+        plot_xy[i, 1] + 5,
+        str(i),
+        color="yellow",
+        fontsize=8
+    )
+
+ax.set_xlim(0, canvas_size)
+ax.set_ylim(canvas_size, 0)
+
+ax.set_aspect("equal")
+
+ax.set_title("32 Nearest PSFs Relative to Target XY")
+
+ax.legend(loc="upper right")
+
+plt.tight_layout()
+plt.show()
