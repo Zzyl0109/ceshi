@@ -1,0 +1,426 @@
+import torch
+import torch.nn.functional as F
+
+
+# ============================================================
+# 计算对称正定矩阵的幂
+# ============================================================
+
+def matrix_power_spd(matrix, power, eps=1e-6):
+    """
+    matrix: [B, 2, 2]
+    power: 0.5 / -0.5 / etc.
+    """
+    matrix = 0.5 * (matrix + matrix.transpose(-1, -2))
+
+    eigvals, eigvecs = torch.linalg.eigh(matrix)
+    eigvals = eigvals.clamp_min(eps)
+
+    return (
+        eigvecs * eigvals.pow(power).unsqueeze(-2)
+    ) @ eigvecs.transpose(-1, -2)
+
+
+def matrix_log_spd(matrix, eps=1e-6):
+    matrix = 0.5 * (matrix + matrix.transpose(-1, -2))
+
+    eigvals, eigvecs = torch.linalg.eigh(matrix)
+    eigvals = eigvals.clamp_min(eps)
+
+    return (
+        eigvecs * torch.log(eigvals).unsqueeze(-2)
+    ) @ eigvecs.transpose(-1, -2)
+
+
+def matrix_exp_sym(matrix):
+    matrix = 0.5 * (matrix + matrix.transpose(-1, -2))
+
+    eigvals, eigvecs = torch.linalg.eigh(matrix)
+
+    return (
+        eigvecs * torch.exp(eigvals).unsqueeze(-2)
+    ) @ eigvecs.transpose(-1, -2)
+
+
+# ============================================================
+# 计算 PSF 的质心和二阶矩
+# ============================================================
+
+@torch.no_grad()
+def calculate_psf_moments(psf, eps=1e-8):
+    """
+    psf: [B, H, W]
+
+    return:
+        center: [B, 2]       (x, y)
+        covariance: [B, 2, 2]
+        energy: [B]
+    """
+
+    B, H, W = psf.shape
+
+    # 只使用非负强度
+    psf = psf.clamp_min(0)
+
+    energy = psf.sum(dim=(-2, -1)).clamp_min(eps)
+
+    prob = psf / energy[:, None, None]
+
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=psf.device, dtype=psf.dtype),
+        torch.arange(W, device=psf.device, dtype=psf.dtype),
+        indexing="ij"
+    )
+
+    cx = (prob * xx).sum(dim=(-2, -1))
+    cy = (prob * yy).sum(dim=(-2, -1))
+
+    dx = xx[None] - cx[:, None, None]
+    dy = yy[None] - cy[:, None, None]
+
+    cxx = (prob * dx * dx).sum(dim=(-2, -1))
+    cyy = (prob * dy * dy).sum(dim=(-2, -1))
+    cxy = (prob * dx * dy).sum(dim=(-2, -1))
+
+    covariance = torch.stack([
+        torch.stack([cxx, cxy], dim=-1),
+        torch.stack([cxy, cyy], dim=-1)
+    ], dim=-2)
+
+    # 防止矩阵退化
+    eye = torch.eye(
+        2, device=psf.device, dtype=psf.dtype
+    ).unsqueeze(0)
+
+    covariance = covariance + eye * 1e-4
+
+    center = torch.stack([cx, cy], dim=-1)
+
+    return center, covariance, energy
+
+
+# ============================================================
+# 构造 grid_sample 所需的坐标
+# ============================================================
+
+def make_sampling_grid(src_x, src_y, H, W):
+    """
+    src_x, src_y: [B, H, W]
+    """
+
+    gx = 2.0 * src_x / max(W - 1, 1) - 1.0
+    gy = 2.0 * src_y / max(H - 1, 1) - 1.0
+
+    return torch.stack([gx, gy], dim=-1)
+
+
+# ============================================================
+# 形态归一化：四张 PSF 统一到参考二阶矩
+# ============================================================
+
+@torch.no_grad()
+def normalize_psf_morphology(psf_selected):
+    """
+    psf_selected: [B, 4, H, W]
+
+    return:
+        aligned_psfs: [B, 4, H, W]
+        centers:      [B, 4, 2]
+        covariances:  [B, 4, 2, 2]
+        energies:     [B, 4]
+        ref_center:   [B, 2]
+        ref_cov:      [B, 2, 2]
+    """
+
+    B, K, H, W = psf_selected.shape
+
+    centers = []
+    covariances = []
+    energies = []
+
+    # 分别计算四个深度的形态参数
+    for k in range(K):
+
+        center, cov, energy = calculate_psf_moments(
+            psf_selected[:, k]
+        )
+
+        centers.append(center)
+        covariances.append(cov)
+        energies.append(energy)
+
+    centers = torch.stack(centers, dim=1)
+    covariances = torch.stack(covariances, dim=1)
+    energies = torch.stack(energies, dim=1)
+
+    # 参考中心和参考形态
+    ref_center = centers.mean(dim=1)
+    ref_cov = covariances.mean(dim=1)
+
+    ref_sqrt = matrix_power_spd(ref_cov, 0.5)
+    ref_invsqrt = matrix_power_spd(ref_cov, -0.5)
+
+    # 坐标网格
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=psf_selected.device,
+                     dtype=psf_selected.dtype),
+        torch.arange(W, device=psf_selected.device,
+                     dtype=psf_selected.dtype),
+        indexing="ij"
+    )
+
+    xx = xx[None].expand(B, -1, -1)
+    yy = yy[None].expand(B, -1, -1)
+
+    delta_ref = torch.stack([
+        xx - ref_center[:, 0, None, None],
+        yy - ref_center[:, 1, None, None]
+    ], dim=-1)
+
+    aligned_psfs = []
+
+    for k in range(K):
+
+        # 当前 PSF 的逆变换矩阵
+        cov_sqrt = matrix_power_spd(
+            covariances[:, k], 0.5
+        )
+
+        transform_inv = cov_sqrt @ ref_invsqrt
+
+        # 从统一参考坐标映射回原始 PSF 坐标
+        delta_src = torch.einsum(
+            "bij,bhwj->bhwi",
+            transform_inv,
+            delta_ref
+        )
+
+        src_x = delta_src[..., 0] + centers[:, k, 0, None, None]
+        src_y = delta_src[..., 1] + centers[:, k, 1, None, None]
+
+        grid = make_sampling_grid(src_x, src_y, H, W)
+
+        # 先归一化能量
+        src = psf_selected[:, k].clamp_min(0)
+        src_energy = src.sum(dim=(-2, -1)).clamp_min(1e-8)
+        src = src / src_energy[:, None, None]
+
+        aligned = F.grid_sample(
+            src.unsqueeze(1),
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True
+        ).squeeze(1)
+
+        # 坐标变换的面积补偿
+        det_k = torch.linalg.det(covariances[:, k]).clamp_min(1e-8)
+        det_ref = torch.linalg.det(ref_cov).clamp_min(1e-8)
+
+        aligned = aligned * torch.sqrt(det_k / det_ref)[:, None, None]
+
+        # 消除插值边界导致的能量损失
+        aligned = aligned.clamp_min(0)
+        aligned = aligned / aligned.sum(
+            dim=(-2, -1), keepdim=True
+        ).clamp_min(1e-8)
+
+        aligned_psfs.append(aligned)
+
+    aligned_psfs = torch.stack(aligned_psfs, dim=1)
+
+    return (
+        aligned_psfs,
+        centers,
+        covariances,
+        energies,
+        ref_center,
+        ref_cov
+    )
+
+
+# ============================================================
+# 形态感知纵向插值
+# ============================================================
+
+@torch.no_grad()
+def fast_inter_z_gpu(
+    target_depth,
+    selected_depths,
+    psf_selected
+):
+    """
+    target_depth:
+        [B] 或标量
+
+    selected_depths:
+        [4] 或 [B, 4]
+
+    psf_selected:
+        [B, 4, H, W] 或 [4, H, W]
+
+    return:
+        [B, H, W] 或单张 [H, W]
+    """
+
+    device = psf_selected.device
+    dtype = psf_selected.dtype
+
+    unbatched = psf_selected.ndim == 3
+
+    if unbatched:
+        psf_selected = psf_selected.unsqueeze(0)
+
+    B, K, H, W = psf_selected.shape
+
+    target_depth = torch.as_tensor(
+        target_depth, device=device, dtype=dtype
+    ).reshape(-1)
+
+    if target_depth.numel() == 1 and B > 1:
+        target_depth = target_depth.expand(B)
+
+    selected_depths = torch.as_tensor(
+        selected_depths, device=device, dtype=dtype
+    )
+
+    if selected_depths.ndim == 1:
+        selected_depths = selected_depths.unsqueeze(0).expand(B, -1)
+
+    # --------------------------------------------------------
+    # 1. 四点拉格朗日权重
+    # --------------------------------------------------------
+
+    x0 = selected_depths[:, 0]
+    x1 = selected_depths[:, 1]
+    x2 = selected_depths[:, 2]
+    x3 = selected_depths[:, 3]
+
+    t = target_depth
+
+    den0 = (x0-x1)*(x0-x2)*(x0-x3)
+    den1 = (x1-x0)*(x1-x2)*(x1-x3)
+    den2 = (x2-x0)*(x2-x1)*(x2-x3)
+    den3 = (x3-x0)*(x3-x1)*(x3-x2)
+
+    eps = 1e-12
+
+    w0 = ((t-x1)*(t-x2)*(t-x3)) / den0.clamp(min=eps)
+    w1 = ((t-x0)*(t-x2)*(t-x3)) / den1.clamp(min=eps)
+    w2 = ((t-x0)*(t-x1)*(t-x3)) / den2.clamp(min=eps)
+    w3 = ((t-x0)*(t-x1)*(t-x2)) / den3.clamp(min=eps)
+
+    weights = torch.stack([w0, w1, w2, w3], dim=1)
+
+    # --------------------------------------------------------
+    # 2. 计算四张 PSF 的形态并统一尺度
+    # --------------------------------------------------------
+
+    (
+        aligned_psfs,
+        centers,
+        covariances,
+        energies,
+        ref_center,
+        ref_cov
+    ) = normalize_psf_morphology(psf_selected)
+
+    # --------------------------------------------------------
+    # 3. 统一形态下的 PSF 强度插值
+    # --------------------------------------------------------
+
+    aligned_result = (
+        weights[:, :, None, None] * aligned_psfs
+    ).sum(dim=1)
+
+    aligned_result = aligned_result.clamp_min(0)
+
+    aligned_result = aligned_result / aligned_result.sum(
+        dim=(-2, -1), keepdim=True
+    ).clamp_min(1e-8)
+
+    # --------------------------------------------------------
+    # 4. 插值目标深度的中心
+    # --------------------------------------------------------
+
+    target_center = (
+        weights[:, :, None] * centers
+    ).sum(dim=1)
+
+    # --------------------------------------------------------
+    # 5. 对协方差矩阵进行 Log-Euclidean 插值
+    # --------------------------------------------------------
+
+    log_cov = matrix_log_spd(covariances.reshape(-1, 2, 2))
+
+    log_cov = log_cov.reshape(B, 4, 2, 2)
+
+    target_log_cov = (
+        weights[:, :, None, None] * log_cov
+    ).sum(dim=1)
+
+    target_cov = matrix_exp_sym(target_log_cov)
+
+    # --------------------------------------------------------
+    # 6. 将统一形态的 PSF 恢复到目标深度的形态
+    # --------------------------------------------------------
+
+    ref_sqrt = matrix_power_spd(ref_cov, 0.5)
+    target_invsqrt = matrix_power_spd(target_cov, -0.5)
+
+    transform = ref_sqrt @ target_invsqrt
+
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device, dtype=dtype),
+        torch.arange(W, device=device, dtype=dtype),
+        indexing="ij"
+    )
+
+    xx = xx[None].expand(B, -1, -1)
+    yy = yy[None].expand(B, -1, -1)
+
+    delta = torch.stack([
+        xx - target_center[:, 0, None, None],
+        yy - target_center[:, 1, None, None]
+    ], dim=-1)
+
+    # 目标坐标映射到统一形态坐标
+    delta_ref = torch.einsum(
+        "bij,bhwj->bhwi",
+        transform,
+        delta
+    )
+
+    ref_x = delta_ref[..., 0] + ref_center[:, 0, None, None]
+    ref_y = delta_ref[..., 1] + ref_center[:, 1, None, None]
+
+    grid = make_sampling_grid(ref_x, ref_y, H, W)
+
+    result = F.grid_sample(
+        aligned_result.unsqueeze(1),
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True
+    ).squeeze(1)
+
+    # --------------------------------------------------------
+    # 7. 恢复 PSF 总能量
+    # --------------------------------------------------------
+
+    target_energy = (
+        weights * energies
+    ).sum(dim=1).clamp_min(1e-8)
+
+    result = result.clamp_min(0)
+
+    result = result / result.sum(
+        dim=(-2, -1), keepdim=True
+    ).clamp_min(1e-8)
+
+    result = result * target_energy[:, None, None]
+
+    if unbatched:
+        return result[0]
+
+    return result
